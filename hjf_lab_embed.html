@@ -1,0 +1,3134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HJF 物资申报出库一键核算前端工具 v3.2（支持多文件批量连算）</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Microsoft YaHei", sans-serif; }
+    .excel-grid { border-collapse: separate; border-spacing: 0; }
+    .excel-grid th, .excel-grid td { border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1; white-space: nowrap; }
+    .excel-grid th:first-child, .excel-grid td:first-child { position: sticky; left: 0; z-index: 15; border-right: 1px solid #94a3b8; }
+    .excel-grid thead th:first-child { z-index: 30; background-color: #1e293b; }
+    .excel-grid td[data-r] { cursor: cell; position: relative; }
+    .excel-grid td.row-idx-cell { cursor: pointer; background-color: #f8fafc; }
+    .excel-grid td.row-idx-cell:hover { background-color: #e2e8f0; color: #1e293b; }
+    .excel-grid thead th[data-col] { cursor: pointer; }
+    .excel-grid thead th[data-col]:hover { background-color: #334155; }
+    /* 借鉴 x-spreadsheet / Handsontable 的区域外框选高亮样式 */
+    .excel-cell-selected { background-color: rgba(37, 99, 235, 0.13) !important; }
+    .excel-cell-active { background-color: rgba(37, 99, 235, 0.05) !important; box-shadow: inset 0 0 0 2px #1d4ed8; z-index: 8; }
+    .sel-top { border-top: 2px solid #2563eb !important; }
+    .sel-bottom { border-bottom: 2px solid #2563eb !important; }
+    .sel-left { border-left: 2px solid #2563eb !important; }
+    .sel-right { border-right: 2px solid #2563eb !important; }
+    .fill-preview { background-color: rgba(16, 185, 129, 0.16) !important; outline: 1px dashed #059669; }
+    .excel-fill-handle {
+      position: absolute; right: -4px; bottom: -4px; width: 9px; height: 9px;
+      background: #1d4ed8; border: 1.5px solid #fff; border-radius: 1px;
+      cursor: crosshair; z-index: 25; box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+    }
+    .pan-mode-active, .pan-mode-active td[data-r], .pan-mode-active td.row-idx-cell { cursor: grab !important; }
+    .pan-mode-grabbing, .pan-mode-grabbing td[data-r] { cursor: grabbing !important; }
+    .no-select { user-select: none; -webkit-user-select: none; }
+    .blank-sep-row td { background-color: #f8fafc; color: #94a3b8; height: 26px; }
+    .pg-hit-badge { background-color: #ecfdf5; color: #047857; font-weight: 600; }
+    /* 自定义更顺滑的细滚动条 */
+    .grid-scroll::-webkit-scrollbar { width: 9px; height: 9px; }
+    .grid-scroll::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 6px; }
+    .grid-scroll::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 6px; border: 2px solid #f1f5f9; }
+    .grid-scroll::-webkit-scrollbar-thumb:hover { background: #64748b; }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800 min-h-screen">
+
+<div class="max-w-7xl mx-auto bg-white shadow-md sm:my-4 sm:rounded-xl overflow-hidden border border-slate-200">
+  <!-- 顶部标题与状态指示灯 -->
+  <div class="bg-gradient-to-r from-blue-800 to-blue-600 text-white px-4 py-3.5 sm:px-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+    <div>
+      <h1 class="text-base sm:text-lg font-bold tracking-wide">HJF 物资申报出库一键核算前端工具</h1>
+      <p class="text-xs text-blue-100 mt-0.5">云端数据库实时同步 · 14列标准自动输出 · 历史底表总账实时联动</p>
+    </div>
+    <div class="flex flex-wrap items-center gap-2 text-xs">
+      <span id="engineHealthBadge" class="bg-amber-500/30 border border-amber-200/50 px-3 py-1 rounded-full font-medium">⏳ 脚本初始化中...</span>
+      <span id="cloudStatusBadge" class="bg-white/20 px-3 py-1 rounded-full font-medium">⚪ 云端检测中...</span>
+      <span id="pgBadge" class="bg-white/20 px-3 py-1 rounded-full font-medium">P3/GD1库存: 0 条</span>
+    </div>
+  </div>
+
+  <!-- 云端实时同步与工作簿导出续接栏 -->
+  <div class="bg-blue-50/90 border-b border-blue-200 px-4 sm:px-6 py-2.5 space-y-2 text-xs">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="font-bold text-blue-900">☁️ 云端数据库与私有 Gist 备份（改代码不丢数据）：</span>
+        <button onclick="toggleGistConfig()" class="h-7 px-2.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded">⚙️ 配置 Gist 云库</button>
+        <button onclick="syncGistNow(true)" class="h-7 px-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded">🔄 立即同步</button>
+        <button onclick="openDeptModal()" class="h-7 px-2.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded">👥 维护车间/领料人</button>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <button onclick="exportWorkbookWithLedger()" class="h-7 px-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded">📦 导出总账 .xlsx</button>
+        <label class="h-7 px-2.5 bg-white hover:bg-slate-50 text-indigo-700 border border-indigo-300 font-semibold rounded flex items-center cursor-pointer">
+          📂 导入工作簿续接
+          <input type="file" id="importWorkbookInput" accept=".xlsx,.xls" class="hidden" onchange="importWorkbookLedger(event)" />
+        </label>
+      </div>
+    </div>
+    <!-- 折叠式 GitHub Gist 配置面板 -->
+    <div id="gistConfigPanel" class="hidden bg-white border border-blue-200 rounded-lg p-3 space-y-2">
+      <div class="text-slate-600 leading-relaxed">
+        <b>GitHub Gist 私有云库（可选双保险）：</b>数据可同步写入你自己的私有 Gist（<code class="bg-slate-100 px-1 rounded">hjf_ledger_db.json</code>），永久免费且与前端代码解耦。填入仅勾选 <code class="bg-slate-100 px-1 rounded">gist</code> 权限的 Token，Gist ID 留空可自动新建。
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <input type="password" id="gistTokenInput" placeholder="GitHub Personal Access Token (ghp_...)" class="h-8 px-2.5 border border-slate-300 rounded bg-slate-50 font-mono text-xs" />
+        <input type="text" id="gistIdInput" placeholder="Gist ID（首次使用可留空，自动创建）" class="h-8 px-2.5 border border-slate-300 rounded bg-slate-50 font-mono text-xs" />
+        <div class="flex gap-1.5">
+          <button onclick="saveAndConnectGist()" class="flex-1 h-8 px-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded">保存并连接</button>
+          <button onclick="disconnectGist()" class="h-8 px-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 rounded">断开</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 顶部双页面导航页签 -->
+  <div class="bg-slate-100 border-b border-slate-200 px-4 sm:px-6 pt-2.5 flex items-center gap-2 overflow-x-auto">
+    <button id="tabBtnWork" onclick="switchPage('work')" class="px-4 py-2.5 text-xs sm:text-sm font-bold rounded-t-lg border-t border-l border-r border-slate-200 bg-white text-blue-700 -mb-px whitespace-nowrap">
+      1. 领料核算工作台
+    </button>
+    <button id="tabBtnMaster" onclick="switchPage('master')" class="px-4 py-2.5 text-xs sm:text-sm font-semibold rounded-t-lg text-slate-600 hover:text-slate-900 flex items-center gap-1.5 whitespace-nowrap">
+      <span>2. 历史出库底表（总账可编辑）</span>
+      <span id="ledgerCountBadge" class="px-1.5 py-0.5 text-[11px] rounded-full bg-blue-100 text-blue-700 font-bold">0</span>
+    </button>
+  </div>
+
+  <!-- ==================== 页面 1：领料核算工作台 ==================== -->
+  <div id="pageWork" class="p-4 sm:p-6 space-y-4">
+    <!-- 参数导入卡片 -->
+    <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-4">
+      <h2 class="text-sm font-bold text-blue-900">1. 导入申报单与核算参数</h2>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">车间领料申报单 (.xlsx/.xls，支持框选多文件批量连算)</label>
+          <input type="file" id="fileInput" multiple accept=".xlsx,.xls" class="w-full h-10 px-2 py-1.5 border border-slate-300 rounded-lg bg-white text-slate-700 file:mr-2 file:py-1 file:px-2.5 file:rounded file:border-0 file:text-xs file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100" />
+        </div>
+
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">工作表 (Sheet，多标签表格选目标子表)</label>
+          <select id="sheetSelect" class="w-full h-10 px-3 border border-slate-300 rounded-lg bg-white text-slate-800">
+            <option value="">-- 请先选择申报单文件 --</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">目标业务日期（防跨日误差必填）</label>
+          <input type="date" id="dateInput" class="w-full h-10 px-3 border border-slate-300 rounded-lg bg-white text-slate-800" />
+        </div>
+
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">申报部门（留空自动识别，支持简称/大部门）</label>
+          <input type="text" id="deptInput" placeholder="自动识别，或手动填写如：电炉二车间" class="w-full h-10 px-3 border border-slate-300 rounded-lg bg-white text-slate-800" />
+        </div>
+      </div>
+
+      <!-- P3 / GD1 双独立现存量上传 -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs pt-1 border-t border-slate-200/80">
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">P3 现存量表（可选，独立导入不覆盖 GD1）</label>
+          <input type="file" id="p3FileInput" accept=".xlsx,.xls" class="w-full h-9 px-2 py-1 border border-slate-300 rounded-lg bg-white text-slate-700 file:mr-2 file:py-0.5 file:px-2 file:rounded file:border-0 file:text-xs file:font-semibold file:bg-emerald-50 file:text-emerald-700 hover:file:bg-emerald-100" />
+        </div>
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">GD1 现存量表（可选，独立导入不覆盖 P3）</label>
+          <input type="file" id="gd1FileInput" accept=".xlsx,.xls" class="w-full h-9 px-2 py-1 border border-slate-300 rounded-lg bg-white text-slate-700 file:mr-2 file:py-0.5 file:px-2 file:rounded file:border-0 file:text-xs file:font-semibold file:bg-emerald-50 file:text-emerald-700 hover:file:bg-emerald-100" />
+        </div>
+      </div>
+
+      <!-- 核心操作按钮组 -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-2.5 pt-1">
+        <button onclick="runAudit()" class="h-11 bg-blue-700 hover:bg-blue-800 active:scale-[0.99] text-white font-bold rounded-xl shadow-sm flex items-center justify-center gap-1.5 text-xs sm:text-sm">
+          <span>▶ 一键核算</span>
+        </button>
+        <button onclick="copyWorkTable()" class="h-11 bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] text-white font-bold rounded-xl shadow-sm flex items-center justify-center gap-1.5 text-xs sm:text-sm">
+          <span>📋 复制 14 列表格</span>
+        </button>
+        <button onclick="exportWorkXlsx()" class="h-11 bg-indigo-700 hover:bg-indigo-800 active:scale-[0.99] text-white font-bold rounded-xl shadow-sm flex items-center justify-center gap-1.5 text-xs sm:text-sm">
+          <span>📥 导出 .xlsx</span>
+        </button>
+        <button id="dedupToggleBtn" onclick="toggleDedupMode()" class="h-11 bg-teal-600 hover:bg-teal-700 active:scale-[0.99] text-white font-bold rounded-xl shadow-sm flex items-center justify-center gap-1.5 text-xs sm:text-sm">
+          <span>🛡️ 自动防重：已开启</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 状态反馈横幅 -->
+    <div id="statusBox" class="hidden border rounded-xl px-4 py-3 text-xs leading-relaxed"></div>
+
+    <!-- 工作台表格工具栏与批量编辑栏 -->
+    <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+      <div class="flex flex-wrap items-center gap-2">
+        <button onclick="addBlankWorkRow()" class="h-8 px-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg">+ 新增一行</button>
+        <button onclick="deleteSelectedWorkRows()" class="h-8 px-3 bg-rose-100 hover:bg-rose-200 text-rose-800 font-semibold rounded-lg">- 删除选中行</button>
+        <button onclick="selectAllGrid('work')" class="h-8 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg">全选表格</button>
+        <button onclick="togglePanMode()" class="pan-mode-btn h-8 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 font-semibold rounded-lg">🖱️ Excel 选格模式</button>
+      </div>
+      <div class="text-slate-500">提示：<b>左键拖动</b>顺滑框选（到边缘自动滚动）；<b>右下角蓝点</b>拖拽填充；<b>单击行号/表头</b>选整行整列；<b>直接打字/双击</b>编辑；<b>Ctrl+C/V</b>复制粘贴；<b>空格/Ctrl+拖动</b>平移</div>
+    </div>
+
+    <div id="workBulkBar" class="hidden bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 flex flex-wrap items-center gap-2 text-xs">
+      <span id="workSelInfo" class="font-bold text-blue-900">已选中 0 格</span>
+      <input type="text" id="workBulkInput" placeholder="输入批量填充内容（留空则清空选中格）..." class="h-7 px-2.5 border border-blue-300 rounded bg-white text-slate-800 w-56" />
+      <button onclick="applyBulkFill('work')" class="h-7 px-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded">批量填充选中格</button>
+      <button onclick="copySelectedRange('work')" class="h-7 px-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded">复制选中区域</button>
+      <button onclick="clearSelection('work')" class="h-7 px-2 bg-white border border-slate-300 rounded text-slate-600">取消框选</button>
+    </div>
+
+    <!-- 工作台 14 列输出表格（去除多余底部空白，按数据自然高度展示） -->
+    <div id="workScrollWrap" class="grid-scroll border border-slate-300 rounded-xl overflow-auto max-h-[72vh] bg-white">
+      <table id="workTable" class="excel-grid w-full text-xs">
+        <thead class="bg-slate-800 text-white sticky top-0 z-20">
+          <tr>
+            <th class="px-2 py-2 w-10 text-center" onclick="selectAllGrid('work')" title="点击全选表格">#</th>
+            <th data-col="0" class="px-2.5 py-2">1.车间</th>
+            <th data-col="1" class="px-2.5 py-2">2.领料人</th>
+            <th data-col="2" class="px-2.5 py-2">3.仓库</th>
+            <th data-col="3" class="px-2.5 py-2">4.物料编码</th>
+            <th data-col="4" class="px-2.5 py-2">5.物资名称</th>
+            <th data-col="5" class="px-2.5 py-2">6.数量</th>
+            <th data-col="6" class="px-2.5 py-2">7.单位</th>
+            <th data-col="7" class="px-2.5 py-2">8.实际项目号</th>
+            <th data-col="8" class="px-2.5 py-2">9.生产线</th>
+            <th data-col="9" class="px-2.5 py-2">10.使用位置</th>
+            <th data-col="10" class="px-2.5 py-2">11.收支项目</th>
+            <th data-col="11" class="px-2.5 py-2">12.备注</th>
+            <th data-col="12" class="px-2.5 py-2">13.自取/补单</th>
+            <th data-col="13" class="px-2.5 py-2">14.特殊情况</th>
+          </tr>
+        </thead>
+        <tbody id="workTbody">
+          <tr><td colspan="15" class="text-center py-8 text-slate-400">请先上传车间领料申报单并点击“一键核算”</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ==================== 页面 2：历史出库底表（总账可编辑） ==================== -->
+  <div id="pageMaster" class="hidden p-4 sm:p-6 space-y-4">
+    <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+      <div>
+        <h2 class="text-sm font-bold text-blue-900">📚 历史物资出库底表总账（自动排序并保留组间分隔空行，支持批量修改）</h2>
+        <p class="text-xs text-slate-500 mt-0.5">每次“一键核算”放行的新增记录会自动归档至此底表；双击单元格可修改，左键单击/拖动可批量框选填充，按住 Ctrl+拖动可平移滑动表格。</p>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
+        <select id="masterDateFilter" onchange="renderMasterTable()" class="h-9 px-3 border border-slate-300 rounded-lg bg-white text-slate-800">
+          <option value="ALL">全部日期底表 (0 条)</option>
+        </select>
+        <input type="text" id="masterSearchInput" oninput="renderMasterTable()" placeholder="搜索车间 / 领料人 / 物料编码 / 物资名称..." class="h-9 px-3 border border-slate-300 rounded-lg bg-white text-slate-800 sm:col-span-2" />
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2 text-xs pt-1">
+        <button onclick="addBlankMasterRow()" class="h-8 px-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg">+ 底表新增一行</button>
+        <button onclick="deleteSelectedMasterRows()" class="h-8 px-3 bg-rose-100 hover:bg-rose-200 text-rose-800 font-semibold rounded-lg">- 删除选中底表行</button>
+        <button onclick="selectAllGrid('master')" class="h-8 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg">全选底表</button>
+        <button onclick="togglePanMode()" class="pan-mode-btn h-8 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 font-semibold rounded-lg">🖱️ Excel 选格模式</button>
+        <button onclick="copyMasterTable()" class="h-8 px-3 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg">📋 复制当前底表 (14列)</button>
+        <button onclick="exportWorkbookWithLedger()" class="h-8 px-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg">📥 导出底表总账 .xlsx</button>
+        <span class="text-slate-300">|</span>
+        <button onclick="clearMasterBySelectedDate()" class="h-8 px-2.5 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 font-semibold rounded-lg">🗑️ 清除所选日期数据</button>
+        <button onclick="pruneMasterKeepRecent7Days()" class="h-8 px-2.5 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 font-semibold rounded-lg">🧹 仅保留最近7天</button>
+        <button id="clearAllMasterBtn" onclick="clearAllMasterConfirm()" class="h-8 px-2.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-300 font-semibold rounded-lg">⚠️ 清空全部后台数据</button>
+      </div>
+    </div>
+
+    <div id="masterBulkBar" class="hidden bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 flex flex-wrap items-center gap-2 text-xs">
+      <span id="masterSelInfo" class="font-bold text-blue-900">已选中 0 格</span>
+      <input type="text" id="masterBulkInput" placeholder="输入批量填充内容（留空则清空选中格）..." class="h-7 px-2.5 border border-blue-300 rounded bg-white text-slate-800 w-56" />
+      <button onclick="applyBulkFill('master')" class="h-7 px-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded">批量填充选中格</button>
+      <button onclick="copySelectedRange('master')" class="h-7 px-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded">复制选中区域</button>
+      <button onclick="clearSelection('master')" class="h-7 px-2 bg-white border border-slate-300 rounded text-slate-600">取消框选</button>
+    </div>
+
+    <div id="masterScrollWrap" class="grid-scroll border border-slate-300 rounded-xl overflow-auto max-h-[72vh] bg-white">
+      <table id="masterTable" class="excel-grid w-full text-xs">
+        <thead class="bg-slate-800 text-white sticky top-0 z-20">
+          <tr>
+            <th class="px-2 py-2 w-10 text-center" onclick="selectAllGrid('master')" title="点击全选底表">#</th>
+            <th data-col="0" class="px-2.5 py-2">业务日期</th>
+            <th data-col="1" class="px-2.5 py-2">1.车间</th>
+            <th data-col="2" class="px-2.5 py-2">2.领料人</th>
+            <th data-col="3" class="px-2.5 py-2">3.仓库</th>
+            <th data-col="4" class="px-2.5 py-2">4.物料编码</th>
+            <th data-col="5" class="px-2.5 py-2">5.物资名称</th>
+            <th data-col="6" class="px-2.5 py-2">6.数量</th>
+            <th data-col="7" class="px-2.5 py-2">7.单位</th>
+            <th data-col="8" class="px-2.5 py-2">8.实际项目号</th>
+            <th data-col="9" class="px-2.5 py-2">9.生产线</th>
+            <th data-col="10" class="px-2.5 py-2">10.使用位置</th>
+            <th data-col="11" class="px-2.5 py-2">11.收支项目</th>
+            <th data-col="12" class="px-2.5 py-2">12.备注</th>
+            <th data-col="13" class="px-2.5 py-2">13.自取/补单</th>
+            <th data-col="14" class="px-2.5 py-2">14.特殊情况</th>
+          </tr>
+        </thead>
+        <tbody id="masterTbody">
+          <tr><td colspan="16" class="text-center py-8 text-slate-400">暂无历史出库底表记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 悬浮提示消息条 -->
+<div id="toastMsg" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white text-xs sm:text-sm px-4 py-2.5 rounded-xl shadow-xl border border-slate-700 max-w-[90vw] text-center"></div>
+
+<!-- 车间与领料人维护弹窗 -->
+<div id="deptManagerModal" class="hidden fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-[1px] flex items-center justify-center p-4">
+  <div class="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl max-h-[88vh] flex flex-col overflow-hidden text-xs">
+    <div class="bg-slate-800 text-white px-4 py-3 flex items-center justify-between">
+      <div>
+        <h3 class="text-sm font-bold">👥 维护车间与领料人对应关系</h3>
+        <p class="text-[11px] text-slate-300 mt-0.5">新增或修改后自动保存至本地与云端，核算时优先按领料人锁定对应车间及英文前缀</p>
+      </div>
+      <button onclick="closeDeptModal()" class="px-2 py-1 rounded bg-white/10 hover:bg-white/20 text-white font-bold">✕</button>
+    </div>
+
+    <div class="p-4 space-y-3 overflow-y-auto">
+      <!-- 新增/更新表单 -->
+      <div class="bg-blue-50/70 border border-blue-200 rounded-lg p-3 space-y-2.5">
+        <div class="font-bold text-blue-900">➕ 新增 / 覆盖领料人映射</div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <div>
+            <label class="block text-slate-600 mb-1">领料人姓名（支持中文或英文名）</label>
+            <input type="text" id="modalPersonInput" placeholder="如：Susi Kasamu 苏西 / 张三" class="w-full h-8 px-2.5 border border-slate-300 rounded bg-white text-slate-800" />
+          </div>
+          <div>
+            <label class="block text-slate-600 mb-1">归属车间（选标准车间或自定义）</label>
+            <select id="modalDeptSelect" onchange="onModalDeptSelectChange()" class="w-full h-8 px-2 border border-slate-300 rounded bg-white text-slate-800"></select>
+          </div>
+          <div>
+            <label class="block text-slate-600 mb-1">英文前缀（留空则不加前缀）</label>
+            <input type="text" id="modalPrefixInput" placeholder="如：ENVIRONMENT" class="w-full h-8 px-2.5 border border-slate-300 rounded bg-white text-slate-800" />
+          </div>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 items-end">
+          <div id="modalCustomDeptWrap" class="hidden">
+            <label class="block text-slate-600 mb-1">自定义新车间名称</label>
+            <input type="text" id="modalCustomDeptInput" placeholder="输入新车间名" class="w-full h-8 px-2.5 border border-slate-300 rounded bg-white text-slate-800" />
+          </div>
+          <div class="sm:col-span-2 flex gap-2">
+            <button onclick="saveCustomPersonMapping()" class="h-8 px-4 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded">💾 保存并立即生效</button>
+            <button onclick="saveCustomPersonMapping(true)" class="h-8 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded">💾 保存并重新核算</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 已保存的自定义变动列表 -->
+      <div>
+        <div class="flex items-center justify-between mb-1.5">
+          <span class="font-bold text-slate-700">📌 已保存的自定义领料人映射（优先级最高）</span>
+          <span id="customMapCount" class="text-slate-400">0 条</span>
+        </div>
+        <div class="border border-slate-200 rounded-lg overflow-hidden">
+          <table class="w-full border-collapse text-xs">
+            <thead class="bg-slate-100 text-slate-700">
+              <tr>
+                <th class="px-2.5 py-1.5 text-left border-b">领料人</th>
+                <th class="px-2.5 py-1.5 text-left border-b">锁定车间</th>
+                <th class="px-2.5 py-1.5 text-left border-b">英文前缀</th>
+                <th class="px-2.5 py-1.5 text-center border-b w-16">操作</th>
+              </tr>
+            </thead>
+            <tbody id="customMapTbody">
+              <tr><td colspan="4" class="text-center py-4 text-slate-400">暂无自定义变动记录</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 云端实时同步模块（v3.1 Canvas Firestore + 本地离线 Gist 双兼容版） ==================== -->
+<script>
+(function () {
+  let cloudDb = null;
+  let cloudUser = null;
+  let cloudUnsub = null;
+  let isApplyingRemote = false;
+
+  function setCloudBadge(text, cls) {
+    const b = document.getElementById("cloudStatusBadge");
+    if (b) {
+      b.textContent = text;
+      b.className = cls + " px-3 py-1 rounded-full font-medium";
+    }
+  }
+  window.__setCloudBadge = setCloudBadge;
+
+  async function initCloudBridge() {
+    const gistToken = localStorage.getItem("hjf_gist_token_v1") || "";
+    const gistId = localStorage.getItem("hjf_gist_id_v1") || "";
+    if (gistToken && gistId && typeof window.syncGistNow === "function") {
+      window.syncGistNow(false);
+    }
+
+    // 仅在 Gemini Canvas 注入了 __firebase_config 时动态加载 Firestore，本地 file:// 打开绝不报跨域错
+    if (typeof __firebase_config === "undefined" || !__firebase_config) {
+      if (!gistToken || !gistId) {
+        setCloudBadge("⚪ 本地持久化模式（可配置 Gist 跨端同步）", "bg-amber-500/30 border border-amber-200/50");
+      }
+      return;
+    }
+
+    try {
+      const [{ initializeApp }, { getAuth, signInAnonymously, signInWithCustomToken }, { getFirestore, doc, setDoc, onSnapshot }] = await Promise.all([
+        import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js"),
+        import("https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js"),
+        import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js"),
+      ]);
+      const cfg = typeof __firebase_config === "string" ? JSON.parse(__firebase_config) : __firebase_config;
+      const app = initializeApp(cfg);
+      const auth = getAuth(app);
+      cloudDb = getFirestore(app);
+
+      if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
+        const cred = await signInWithCustomToken(auth, __initial_auth_token);
+        cloudUser = cred.user;
+      } else {
+        const cred = await signInAnonymously(auth);
+        cloudUser = cred.user;
+      }
+
+      const appId = typeof __app_id !== "undefined" ? __app_id : "hjf-material-app";
+      const docRef = doc(cloudDb, "artifacts", appId, "public", "data", "hjf_ledgers", "hjf_shared_team_ledger_v292");
+      setCloudBadge("🔄 正在连接云端数据库...", "bg-blue-500/40");
+      cloudUnsub = onSnapshot(docRef, snap => {
+        setCloudBadge("🟢 云端数据库已实时同步", "bg-emerald-500/30 border border-emerald-200/50");
+        if (!snap.exists()) return;
+        const data = snap.data();
+        isApplyingRemote = true;
+        try {
+          if (typeof window.__applyRemoteLedger === "function") {
+            window.__applyRemoteLedger(data);
+          }
+        } finally {
+          isApplyingRemote = false;
+        }
+      }, () => {
+        setCloudBadge("⚠️ 云端连接断开，已切回本地缓存", "bg-amber-500/30");
+      });
+
+      window.__cloudSetDoc = async payload => {
+        if (!cloudDb || !cloudUser) return;
+        await setDoc(docRef, { ...payload, updatedAt: new Date().toISOString() }, { merge: true });
+      };
+    } catch (err) {
+      console.warn("Cloud bridge fallback:", err);
+      if (!gistToken || !gistId) {
+        setCloudBadge("⚪ 本地持久化模式（可配置 Gist 跨端同步）", "bg-amber-500/30 border border-amber-200/50");
+      }
+    }
+  }
+
+  window.__pushToCloudDb = async function (payload) {
+    if (isApplyingRemote) return;
+    if (typeof window.__pushToGistDebounced === "function") {
+      window.__pushToGistDebounced(payload);
+    }
+    if (typeof window.__cloudSetDoc === "function") {
+      try {
+        await window.__cloudSetDoc(payload);
+      } catch (err) {
+        console.warn("Cloud write skipped:", err);
+      }
+    }
+  };
+
+  window.addEventListener("DOMContentLoaded", () => {
+    initCloudBridge();
+  });
+})();
+</script>
+
+<!-- ==================== 主业务引擎与交互脚本 ==================== -->
+<script>
+// =========================================================================
+// 1. 通用提示、存储层与全局状态
+// =========================================================================
+let toastTimer = null;
+function showToast(msg) {
+  const el = document.getElementById("toastMsg");
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add("hidden"), 2800);
+}
+window.showToast = showToast;
+
+const STORAGE_KEYS = {
+  MASTER: "hjf_master_records_v292",
+  WORK: "hjf_work_rows_v292",
+  P3: "hjf_p3_items_v292",
+  GD1: "hjf_gd1_items_v292",
+  CUSTOM_MAP: "hjf_custom_person_maps_v292",
+  GIST_TOKEN: "hjf_gist_token_v1",
+  GIST_ID: "hjf_gist_id_v1"
+};
+const GIST_FILENAME = "hjf_ledger_db.json";
+const COLS_14 = [
+  "dept", "person", "warehouse", "code", "name", "qty", "unit",
+  "project", "line", "usage", "subject", "remark", "pickup", "special"
+];
+const HEADERS_14 = [
+  "车间", "领料人", "仓库", "物料编码", "物资名称", "数量", "单位",
+  "实际项目号", "生产线", "使用位置", "收支项目", "备注", "自取/补单", "特殊情况"
+];
+
+let gistPushTimer = null;
+let wbCache = null;
+let fileNameCache = "";
+let wbBatchCache = [];
+let p3Items = [];
+let gd1Items = [];
+let pgMap = new Map();
+let pgList = [];
+let workRows = [];
+let masterRecords = [];
+let masterViewRows = [];
+let customPersonMaps = [];
+let dedupEnabled = true;
+let activeGrid = "work";
+let panModeEnabled = false;
+let clearAllArmTimer = null;
+let clearAllArmed = false;
+
+function openIdb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("HJF_Ledger_DB_v292", 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("kv")) db.createObjectStore("kv");
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function copyTextToClipboard(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {
+    document.execCommand("copy");
+  } catch (e) {}
+  document.body.removeChild(ta);
+}
+
+// =========================================================================
+// 2. GitHub Gist 私有云库配置与双保险同步
+// =========================================================================
+function toggleGistConfig() {
+  const panel = document.getElementById("gistConfigPanel");
+  if (!panel) return;
+  panel.classList.toggle("hidden");
+  if (!panel.classList.contains("hidden")) {
+    const tEl = document.getElementById("gistTokenInput");
+    const iEl = document.getElementById("gistIdInput");
+    if (tEl) tEl.value = localStorage.getItem(STORAGE_KEYS.GIST_TOKEN) || "";
+    if (iEl) iEl.value = localStorage.getItem(STORAGE_KEYS.GIST_ID) || "";
+  }
+}
+
+async function saveAndConnectGist() {
+  const token = (document.getElementById("gistTokenInput")?.value || "").trim();
+  const gistId = (document.getElementById("gistIdInput")?.value || "").trim();
+  if (!token) return showToast("请先填写 GitHub Personal Access Token");
+  localStorage.setItem(STORAGE_KEYS.GIST_TOKEN, token);
+  if (gistId) localStorage.setItem(STORAGE_KEYS.GIST_ID, gistId);
+  await syncGistNow(true);
+}
+
+function disconnectGist() {
+  localStorage.removeItem(STORAGE_KEYS.GIST_TOKEN);
+  localStorage.removeItem(STORAGE_KEYS.GIST_ID);
+  const tEl = document.getElementById("gistTokenInput");
+  const iEl = document.getElementById("gistIdInput");
+  if (tEl) tEl.value = "";
+  if (iEl) iEl.value = "";
+  if (typeof window.__setCloudBadge === "function") {
+    window.__setCloudBadge("⚪ 已断开 Gist（本地缓存中）", "bg-amber-500/30 border border-amber-200/50");
+  }
+  showToast("已断开 GitHub Gist 连接");
+}
+
+async function syncGistNow(manual = false) {
+  const token = (localStorage.getItem(STORAGE_KEYS.GIST_TOKEN) || "").trim();
+  let gistId = (localStorage.getItem(STORAGE_KEYS.GIST_ID) || "").trim();
+  if (!token) {
+    if (manual) toggleGistConfig();
+    return;
+  }
+  try {
+    if (typeof window.__setCloudBadge === "function") {
+      window.__setCloudBadge("🔄 正在同步 Gist 云库...", "bg-blue-500/40");
+    }
+    const headers = {
+      "Authorization": `Bearer ${token}`,
+      "Accept": "application/vnd.github+json",
+      "Content-Type": "application/json"
+    };
+
+    if (!gistId) {
+      const payload = JSON.stringify({
+        masterRecords, workRows, p3Items, gd1Items, customPersonMaps, updatedAt: new Date().toISOString()
+      });
+      const res = await fetch("https://api.github.com/gists", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          description: "HJF Material Ledger Backup",
+          public: false,
+          files: { [GIST_FILENAME]: { content: payload } }
+        })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const created = await res.json();
+      gistId = created.id;
+      localStorage.setItem(STORAGE_KEYS.GIST_ID, gistId);
+      const iEl = document.getElementById("gistIdInput");
+      if (iEl) iEl.value = gistId;
+    } else {
+      const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const raw = data.files?.[GIST_FILENAME]?.content;
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (typeof window.__applyRemoteLedger === "function") {
+          window.__applyRemoteLedger(parsed);
+        }
+      }
+      await pushToGistImmediate({ masterRecords, workRows, p3Items, gd1Items, customPersonMaps });
+    }
+
+    if (typeof window.__setCloudBadge === "function") {
+      window.__setCloudBadge("🟢 Gist 云库已实时同步", "bg-emerald-500/30 border border-emerald-200/50");
+    }
+    if (manual) showToast("Gist 云库同步成功！");
+  } catch (err) {
+    console.warn("Gist sync failed:", err);
+    if (typeof window.__setCloudBadge === "function") {
+      window.__setCloudBadge("⚠️ Gist 同步受限（已本地保存）", "bg-amber-500/30");
+    }
+    if (manual) showToast("Gist 同步失败，请检查 Token 或网络");
+  }
+}
+window.syncGistNow = syncGistNow;
+
+async function pushToGistImmediate(payload) {
+  const token = (localStorage.getItem(STORAGE_KEYS.GIST_TOKEN) || "").trim();
+  const gistId = (localStorage.getItem(STORAGE_KEYS.GIST_ID) || "").trim();
+  if (!token || !gistId) return;
+  try {
+    const content = JSON.stringify({ ...payload, updatedAt: new Date().toISOString() });
+    await fetch(`https://api.github.com/gists/${gistId}`, {
+      method: "PATCH",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        files: { [GIST_FILENAME]: { content } }
+      })
+    });
+  } catch (e) {}
+}
+
+window.__pushToGistDebounced = function(payload) {
+  clearTimeout(gistPushTimer);
+  gistPushTimer = setTimeout(() => pushToGistImmediate(payload), 1500);
+};
+
+// =========================================================================
+// 3. 表格交互引擎（借鉴 Handsontable / x-spreadsheet：流畅框选、边缘自动滚动、填充柄、行列头选、空格/Ctrl平移）
+// =========================================================================
+let spaceKeyHeld = false;
+window.addEventListener("keydown", e => {
+  const tag = (document.activeElement?.tagName || "").toLowerCase();
+  if (e.code === "Space" && tag !== "input" && tag !== "textarea" && tag !== "select") {
+    spaceKeyHeld = true;
+    document.querySelectorAll(".grid-scroll").forEach(w => w.classList.add("pan-mode-active"));
+  }
+});
+window.addEventListener("keyup", e => {
+  if (e.code === "Space") {
+    spaceKeyHeld = false;
+    if (!panModeEnabled) {
+      document.querySelectorAll(".grid-scroll").forEach(w => w.classList.remove("pan-mode-active"));
+    }
+  }
+});
+
+function togglePanMode() {
+  panModeEnabled = !panModeEnabled;
+  const wraps = [document.getElementById("workScrollWrap"), document.getElementById("masterScrollWrap")];
+  wraps.forEach(w => {
+    if (w) w.classList.toggle("pan-mode-active", panModeEnabled);
+  });
+  document.querySelectorAll(".pan-mode-btn").forEach(btn => {
+    if (panModeEnabled) {
+      btn.textContent = "✋ 拖曳平移模式";
+      btn.className = "pan-mode-btn h-8 px-3 bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-400 font-semibold rounded-lg";
+    } else {
+      btn.textContent = "🖱️ Excel 选格模式";
+      btn.className = "pan-mode-btn h-8 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 font-semibold rounded-lg";
+    }
+  });
+  showToast(panModeEnabled ? "已切换为拖曳平移模式（左键按住即可拖动表格）" : "已恢复 Excel 选格模式（左键框选，按住空格或 Ctrl 拖动平移）");
+}
+
+function startInlineEdit(grid, r, c, initChar = null) {
+  const tbody = document.getElementById(grid === "work" ? "workTbody" : "masterTbody");
+  if (!tbody) return;
+  const td = tbody.querySelector(`td[data-r="${r}"][data-c="${c}"]`);
+  if (!td || td.querySelector("input")) return;
+  const rows = getGridRows(grid);
+  const keys = getGridKeys(grid);
+  const row = rows[r];
+  if (!row) return;
+  const key = keys[c];
+  const oldVal = row[key] ?? "";
+
+  const inp = document.createElement("input");
+  inp.type = "text";
+  inp.value = initChar !== null ? initChar : oldVal;
+  inp.className = "w-full min-w-[90px] px-1.5 py-0.5 text-xs border-2 border-blue-600 rounded bg-white text-slate-900 outline-none";
+  td.innerHTML = "";
+  td.appendChild(inp);
+  inp.focus();
+  if (initChar === null) inp.select();
+
+  let committed = false;
+  const commit = (restore = false, moveDir = null) => {
+    if (committed) return;
+    committed = true;
+    const finalVal = restore ? oldVal : inp.value;
+    row[key] = finalVal;
+    if (!restore && !row._isBlank) syncMasterRowEdit(row);
+    if (!restore) persistAllState(true);
+    // 就地更新单元格 DOM，不重绘整表，避免滚动条跳动
+    td.textContent = finalVal;
+    if (moveDir) {
+      const nr = Math.max(0, Math.min(rows.length - 1, r + moveDir[0]));
+      const nc = Math.max(0, Math.min(keys.length - 1, c + moveDir[1]));
+      selState[grid] = { active: true, dragging: false, r0: nr, c0: nc, r1: nr, c1: nc };
+    }
+    applySelectionStyles(grid);
+  };
+  inp.addEventListener("blur", () => commit(false));
+  inp.addEventListener("keydown", ke => {
+    if (ke.key === "Enter") {
+      ke.preventDefault();
+      commit(false, [1, 0]);
+    } else if (ke.key === "Tab") {
+      ke.preventDefault();
+      commit(false, [0, ke.shiftKey ? -1 : 1]);
+    } else if (ke.key === "Escape") {
+      ke.preventDefault();
+      commit(true);
+    }
+  });
+}
+
+function setupGridInteractions(grid) {
+  const table = document.getElementById(grid === "work" ? "workTable" : "masterTable");
+  const tbody = document.getElementById(grid === "work" ? "workTbody" : "masterTbody");
+  const wrap = document.getElementById(grid === "work" ? "workScrollWrap" : "masterScrollWrap");
+  if (!table || !tbody || !wrap) return;
+
+  let mode = null; // 'cell' | 'row' | 'col' | 'fill' | 'pan'
+  let panStartX = 0, panStartY = 0, scrollStartX = 0, scrollStartY = 0;
+  let lastClientX = 0, lastClientY = 0;
+  let autoScrollRaf = null;
+  let fillTarget = null;
+
+  const stopAutoScroll = () => {
+    if (autoScrollRaf) {
+      cancelAnimationFrame(autoScrollRaf);
+      autoScrollRaf = null;
+    }
+  };
+
+  const updateSelectionByPoint = (clientX, clientY) => {
+    const el = document.elementFromPoint(clientX, clientY);
+    if (!el) return;
+    const rows = getGridRows(grid);
+    const keys = getGridKeys(grid);
+    if (mode === "cell") {
+      const td = el.closest("td[data-r]");
+      if (td && td.dataset.grid === grid) {
+        const nr = Number(td.dataset.r);
+        const nc = Number(td.dataset.c);
+        if (selState[grid].r1 !== nr || selState[grid].c1 !== nc) {
+          selState[grid].r1 = nr;
+          selState[grid].c1 = nc;
+          applySelectionStyles(grid);
+        }
+      }
+    } else if (mode === "row") {
+      const tr = el.closest("tbody tr");
+      const firstTd = tr?.querySelector("td[data-r]");
+      if (firstTd && firstTd.dataset.grid === grid) {
+        const nr = Number(firstTd.dataset.r);
+        if (selState[grid].r1 !== nr) {
+          selState[grid].r1 = nr;
+          selState[grid].c1 = keys.length - 1;
+          applySelectionStyles(grid);
+        }
+      }
+    } else if (mode === "col") {
+      const th = el.closest("th[data-col]");
+      const td = el.closest("td[data-r]");
+      const nc = th ? Number(th.dataset.col) : (td && td.dataset.grid === grid ? Number(td.dataset.c) : -1);
+      if (nc >= 0 && selState[grid].c1 !== nc) {
+        selState[grid].c1 = nc;
+        selState[grid].r1 = rows.length - 1;
+        applySelectionStyles(grid);
+      }
+    } else if (mode === "fill") {
+      const td = el.closest("td[data-r]");
+      if (td && td.dataset.grid === grid) {
+        const nr = Number(td.dataset.r);
+        const nc = Number(td.dataset.c);
+        fillTarget = { r: nr, c: nc };
+        renderFillPreview(grid, fillTarget);
+      }
+    }
+  };
+
+  const runAutoScroll = () => {
+    if (!mode || mode === "pan") {
+      stopAutoScroll();
+      return;
+    }
+    const rect = wrap.getBoundingClientRect();
+    const edge = 38;
+    let dx = 0, dy = 0;
+    if (lastClientX > rect.right - edge) dx = Math.min(24, (lastClientX - (rect.right - edge)) * 0.55);
+    else if (lastClientX < rect.left + edge + 40) dx = -Math.min(24, ((rect.left + edge + 40) - lastClientX) * 0.55);
+    if (lastClientY > rect.bottom - edge) dy = Math.min(24, (lastClientY - (rect.bottom - edge)) * 0.55);
+    else if (lastClientY < rect.top + edge + 32) dy = -Math.min(24, ((rect.top + edge + 32) - lastClientY) * 0.55);
+
+    if (dx !== 0 || dy !== 0) {
+      wrap.scrollLeft += dx;
+      wrap.scrollTop += dy;
+      updateSelectionByPoint(lastClientX, lastClientY);
+    }
+    autoScrollRaf = requestAnimationFrame(runAutoScroll);
+  };
+
+  wrap.addEventListener("mousedown", e => {
+    if (e.target.closest("input, textarea, button")) return;
+    activeGrid = grid;
+    lastClientX = e.clientX;
+    lastClientY = e.clientY;
+
+    // 1. 拖拽右下角填充柄
+    if (e.target.closest(".excel-fill-handle") && e.button === 0) {
+      e.preventDefault();
+      mode = "fill";
+      fillTarget = null;
+      wrap.classList.add("no-select");
+      autoScrollRaf = requestAnimationFrame(runAutoScroll);
+      return;
+    }
+
+    const td = e.target.closest("td[data-r]");
+    const rowIdxTd = e.target.closest("td.row-idx-cell");
+    const colTh = e.target.closest("th[data-col]");
+    const wantPan = panModeEnabled || spaceKeyHeld || e.button === 1 || e.ctrlKey || e.metaKey || (!td && !rowIdxTd && !colTh);
+
+    // 2. 平移拖曳模式（平移开关 / 空格+拖动 / Ctrl+拖动 / 鼠标中键）
+    if (wantPan && (e.button === 0 || e.button === 1)) {
+      e.preventDefault();
+      mode = "pan";
+      panStartX = e.clientX;
+      panStartY = e.clientY;
+      scrollStartX = wrap.scrollLeft;
+      scrollStartY = wrap.scrollTop;
+      wrap.classList.add("no-select", "pan-mode-grabbing");
+      return;
+    }
+
+    if (e.button !== 0) return;
+
+    const rows = getGridRows(grid);
+    const keys = getGridKeys(grid);
+    if (!rows.length) return;
+
+    // 3. 单击列头：选中整列
+    if (colTh) {
+      e.preventDefault();
+      const c = Number(colTh.dataset.col);
+      mode = "col";
+      selState[grid] = { active: true, dragging: true, r0: 0, c0: c, r1: rows.length - 1, c1: c };
+      wrap.classList.add("no-select");
+      applySelectionStyles(grid);
+      autoScrollRaf = requestAnimationFrame(runAutoScroll);
+      return;
+    }
+
+    // 4. 单击行号 #：选中整行
+    if (rowIdxTd) {
+      e.preventDefault();
+      const r = Number(rowIdxTd.dataset.rowidx);
+      mode = "row";
+      selState[grid] = { active: true, dragging: true, r0: r, c0: 0, r1: r, c1: keys.length - 1 };
+      wrap.classList.add("no-select");
+      applySelectionStyles(grid);
+      autoScrollRaf = requestAnimationFrame(runAutoScroll);
+      return;
+    }
+
+    // 5. 普通单元格点击/框选
+    if (td) {
+      e.preventDefault();
+      const r = Number(td.dataset.r);
+      const c = Number(td.dataset.c);
+      mode = "cell";
+      if (e.shiftKey && selState[grid].active && selState[grid].r0 >= 0) {
+        selState[grid].r1 = r;
+        selState[grid].c1 = c;
+        selState[grid].dragging = true;
+      } else {
+        selState[grid] = { active: true, dragging: true, r0: r, c0: c, r1: r, c1: c };
+      }
+      wrap.classList.add("no-select");
+      applySelectionStyles(grid);
+      autoScrollRaf = requestAnimationFrame(runAutoScroll);
+    }
+  });
+
+  window.addEventListener("mousemove", e => {
+    if (!mode) return;
+    lastClientX = e.clientX;
+    lastClientY = e.clientY;
+    if (mode === "pan") {
+      wrap.scrollLeft = scrollStartX - (e.clientX - panStartX);
+      wrap.scrollTop = scrollStartY - (e.clientY - panStartY);
+      return;
+    }
+    updateSelectionByPoint(e.clientX, e.clientY);
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!mode) return;
+    const finishedMode = mode;
+    mode = null;
+    stopAutoScroll();
+    selState[grid].dragging = false;
+    wrap.classList.remove("no-select", "pan-mode-grabbing");
+    if (finishedMode === "fill") {
+      commitFillHandle(grid, fillTarget);
+      fillTarget = null;
+    }
+  });
+
+  wrap.addEventListener("wheel", e => {
+    if (e.shiftKey && Math.abs(e.deltaY) > 0) {
+      e.preventDefault();
+      wrap.scrollLeft += e.deltaY;
+    }
+  }, { passive: false });
+
+  tbody.addEventListener("dblclick", e => {
+    const td = e.target.closest("td[data-r]");
+    if (!td) return;
+    startInlineEdit(grid, Number(td.dataset.r), Number(td.dataset.c));
+  });
+}
+
+function getFillBounds(grid, target) {
+  const b = getSelBounds(grid);
+  if (!b || !target) return null;
+  let { rMin, rMax, cMin, cMax } = b;
+  const drDown = Math.max(0, target.r - rMax);
+  const drUp = Math.max(0, rMin - target.r);
+  const dcRight = Math.max(0, target.c - cMax);
+  const dcLeft = Math.max(0, cMin - target.c);
+  if (Math.max(drDown, drUp) >= Math.max(dcRight, dcLeft)) {
+    if (target.r > rMax) rMax = target.r;
+    else if (target.r < rMin) rMin = target.r;
+  } else {
+    if (target.c > cMax) cMax = target.c;
+    else if (target.c < cMin) cMin = target.c;
+  }
+  return { rMin, rMax, cMin, cMax };
+}
+
+function renderFillPreview(grid, target) {
+  const tbody = document.getElementById(grid === "work" ? "workTbody" : "masterTbody");
+  if (!tbody) return;
+  tbody.querySelectorAll("td.fill-preview").forEach(td => td.classList.remove("fill-preview"));
+  const fb = getFillBounds(grid, target);
+  if (!fb) return;
+  for (let r = fb.rMin; r <= fb.rMax; r++) {
+    const tr = tbody.children[r];
+    if (!tr) continue;
+    for (let c = fb.cMin; c <= fb.cMax; c++) {
+      const td = tr.children[c + 1];
+      if (td) td.classList.add("fill-preview");
+    }
+  }
+}
+
+function commitFillHandle(grid, target) {
+  const tbody = document.getElementById(grid === "work" ? "workTbody" : "masterTbody");
+  if (tbody) tbody.querySelectorAll("td.fill-preview").forEach(td => td.classList.remove("fill-preview"));
+  const src = getSelBounds(grid);
+  const fb = getFillBounds(grid, target);
+  if (!src || !fb) return;
+  if (fb.rMin === src.rMin && fb.rMax === src.rMax && fb.cMin === src.cMin && fb.cMax === src.cMax) return;
+
+  const rows = getGridRows(grid);
+  const keys = getGridKeys(grid);
+  const srcH = src.rMax - src.rMin + 1;
+  const srcW = src.cMax - src.cMin + 1;
+
+  for (let r = fb.rMin; r <= fb.rMax; r++) {
+    const row = rows[r];
+    if (!row) continue;
+    const sr = src.rMin + (((r - src.rMin) % srcH) + srcH) % srcH;
+    for (let c = fb.cMin; c <= fb.cMax; c++) {
+      const sc = src.cMin + (((c - src.cMin) % srcW) + srcW) % srcW;
+      const val = rows[sr]?.[keys[sc]] ?? "";
+      row[keys[c]] = val;
+      const td = tbody?.children[r]?.children[c + 1];
+      if (td) td.textContent = val;
+    }
+    if (!row._isBlank) syncMasterRowEdit(row);
+  }
+
+  selState[grid] = { active: true, dragging: false, r0: fb.rMin, c0: fb.cMin, r1: fb.rMax, c1: fb.cMax };
+  persistAllState(true);
+  applySelectionStyles(grid);
+  showToast(`已通过填充柄填充 ${fb.rMax - fb.rMin + 1} 行 × ${fb.cMax - fb.cMin + 1} 列`);
+}
+
+async function saveKv(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
+  try {
+    const db = await openIdb();
+    const tx = db.transaction("kv", "readwrite");
+    tx.objectStore("kv").put(val, key);
+  } catch (e) {}
+}
+
+async function loadKv(key, fallback) {
+  try {
+    const db = await openIdb();
+    const val = await new Promise((res, rej) => {
+      const tx = db.transaction("kv", "readonly");
+      const req = tx.objectStore("kv").get(key);
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    if (val !== undefined && val !== null) return val;
+  } catch (e) {}
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return fallback;
+}
+
+function persistAllState(pushCloud = true) {
+  saveKv(STORAGE_KEYS.MASTER, masterRecords);
+  saveKv(STORAGE_KEYS.WORK, workRows);
+  saveKv(STORAGE_KEYS.P3, p3Items);
+  saveKv(STORAGE_KEYS.GD1, gd1Items);
+  saveKv(STORAGE_KEYS.CUSTOM_MAP, customPersonMaps);
+  updateLedgerBadge();
+  if (pushCloud && typeof window.__pushToCloudDb === "function") {
+    window.__pushToCloudDb({ masterRecords, workRows, p3Items, gd1Items, customPersonMaps });
+  }
+}
+
+function mergeRecordsById(localArr, remoteArr) {
+  const map = new Map();
+  const addItem = r => {
+    if (!r || typeof r !== "object") return;
+    const id = r._id || `${r.date || ""}|${r.dept || ""}|${r.code || ""}|${r.qty || ""}|${r.name || ""}`;
+    map.set(id, { ...r, _id: id });
+  };
+  (localArr || []).forEach(addItem);
+  (remoteArr || []).forEach(addItem);
+  return Array.from(map.values());
+}
+
+window.__applyRemoteLedger = function(data) {
+  if (!data || typeof data !== "object") return;
+  if (Array.isArray(data.masterRecords) && data.masterRecords.length > 0) {
+    masterRecords = mergeRecordsById(masterRecords, data.masterRecords);
+  }
+  if (Array.isArray(data.workRows) && data.workRows.length > 0 && workRows.length === 0) {
+    workRows = data.workRows;
+  }
+  if (Array.isArray(data.p3Items) && data.p3Items.length > 0) {
+    p3Items = data.p3Items;
+  }
+  if (Array.isArray(data.gd1Items) && data.gd1Items.length > 0) {
+    gd1Items = data.gd1Items;
+  }
+  if (Array.isArray(data.customPersonMaps) && data.customPersonMaps.length > 0) {
+    customPersonMaps = data.customPersonMaps;
+  }
+  rebuildPgMap();
+  saveKv(STORAGE_KEYS.MASTER, masterRecords);
+  saveKv(STORAGE_KEYS.WORK, workRows);
+  saveKv(STORAGE_KEYS.P3, p3Items);
+  saveKv(STORAGE_KEYS.GD1, gd1Items);
+  saveKv(STORAGE_KEYS.CUSTOM_MAP, customPersonMaps);
+  refreshMasterDateOptions();
+  renderWorkTable();
+  renderMasterTable();
+  updateLedgerBadge();
+};
+
+function updateLedgerBadge() {
+  const b = document.getElementById("ledgerCountBadge");
+  if (b) b.textContent = String(masterRecords.filter(r => !r._isBlank).length);
+}
+
+// =========================================================================
+// 4. 核心业务词典与规则配置（v2.9.2 + 公司部门表 + 广义办公/劳保词典）
+// =========================================================================
+const DEPT_MAPS = [
+  // 生产车间与公辅（镍铁冶炼共用 / HF999999999NT9999）
+  { keys: ["电炉一车间", "电炉一", "1#电炉", "2#电炉", "3#电炉", "4#电炉", "FURNACE 1"], persons: ["李广"], std: "电炉一车间", prefix: "FURNACE 1", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 10 },
+  { keys: ["电炉二车间", "电炉二", "5#电炉", "6#电炉", "7#电炉", "8#电炉", "电路二车间", "FURNACE 2"], persons: ["葛继伟"], std: "电炉二车间", prefix: "FURNACE 2", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 20 },
+  { keys: ["回转窑一车间", "回转窑一", "窑一", "ROTARY KILN 1", "KILN 1"], persons: ["卫豪"], std: "回转窑一车间", prefix: "ROTARY KILN 1", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 30 },
+  { keys: ["回转窑二车间", "回转窑二", "窑二", "ROTARY KILN 2", "KILN 2"], persons: ["蒋洪建"], std: "回转窑二车间", prefix: "ROTARY KILN 2", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 40 },
+  { keys: ["机修车间", "机修", "检修车间", "FABRIKASI"], persons: ["席国梁"], std: "机修车间", prefix: "FABRIKASI", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 50 },
+  { keys: ["维修车间", "维修部", "MAINTENANCE"], persons: ["荣统和"], std: "维修车间", prefix: "MAINTENANCE", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "maint", rank: 60 },
+  { keys: ["煤气站一车间", "煤气站一", "煤气一", "GAS STATION 1"], persons: ["孙向阳"], std: "煤气站一车间", prefix: "GAS STATION 1", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 70 },
+  { keys: ["煤气站二车间", "煤气站二", "煤气二", "GAS STATION 2"], persons: ["李勋世"], std: "煤气站二车间", prefix: "GAS STATION 2", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 80 },
+  { keys: ["原料一车间", "原料一", "RAW MATRIAL 1", "RAW MATERIAL 1"], persons: ["陈宝州"], std: "原料一车间", prefix: "RAW MATRIAL 1", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 90 },
+  { keys: ["原料二车间", "原料二", "RAW MATEIAL 2", "RAW MATERIAL 2"], persons: ["赵鹏辉"], std: "原料二车间", prefix: "RAW MATEIAL 2", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 100 },
+  { keys: ["施工管理部", "土建", "CIVIL ENGINEERING"], persons: [], std: "施工管理部", prefix: "CIVIL ENGINEERING", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 110 },
+  { keys: ["质检部", "化验室", "质检中心", "检化验", "实验室", "LABOLATORIUM", "LABORATORIUM", "LABORATORY"], persons: ["赵丽红"], std: "质检部", prefix: "LABOLATORIUM", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "lab", rank: 120 },
+  { keys: ["火法码头", "码头运营中心", "码头", "JETTY HJF", "JETTY"], persons: ["李国胜"], std: "火法码头", prefix: "JETTY HJF", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 130 },
+  { keys: ["设备部", "设备科", "EQUIPMENT"], persons: [], std: "设备部", prefix: "EQUIPMENT", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 140 },
+  { keys: ["氧气站", "制氧站", "制氧车间", "制氧", "OXYGEN STATION", "OXYGEN"], persons: [], std: "氧气站", prefix: "OXYGEN STATION", project: "自制氧气生产", line: "镍铁冶炼共用", type: "oxygen", rank: 150 },
+  { keys: ["电仪部", "电力服务中心", "变电站", "供电车间", "电气车间", "电仪", "ELEKTRIK", "ELEKTRIX", "ELECTRICAL"], persons: ["刘善森"], std: "电仪部", prefix: "ELEKTRIK", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 160 },
+  { keys: ["调度中心", "调度", "DISPATCH"], persons: ["李留震"], std: "调度中心", prefix: "DISPATCH", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "auto", rank: 170 },
+  { keys: ["汽修厂", "P2汽修", "运输汽修部", "汽修车间", "汽修班", "汽修", "WORKSHOP"], persons: ["王龙"], std: "汽修厂", prefix: "WORKSHOP", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "auto", rank: 180 },
+  { keys: ["电厂", "发电厂", "POWERPLANT", "POWER PLANT"], persons: ["王冲"], std: "电厂", prefix: "POWERPLANT", project: "HF999999999DC9999", line: "电厂共用", type: "power", rank: 190 },
+  { keys: ["水系统", "水处理车间", "水处理", "循环水", "净水站", "POMPA AIR"], persons: ["卢亚楠"], std: "水系统", prefix: "POMPA AIR", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 200 },
+  { keys: ["安全部", "安全科", "SAFETY"], persons: ["SIRILA", "陈薇"], std: "安全部", prefix: "SAFETY", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 210 },
+  { keys: ["环境部", "环保部", "ENVIRONMENT"], persons: ["Susi", "Kasamu", "苏西"], std: "环境部", prefix: "ENVIRONMENT", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 220 },
+  { keys: ["仓储物流部", "仓储部", "物流部", "仓库"], persons: ["郑发友", "周磊", "苏效军", "亓文星", "韩延伟"], std: "仓储物流部", prefix: "", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "warehouse_dept", rank: 230 },
+  { keys: ["诊所", "医务室", "卫生所", "KLINIK"], persons: ["Sugianto"], std: "诊所", prefix: "KLINIK", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "clinic", rank: 240 },
+
+  // 后勤、行政、食堂、IT（无生产线）
+  { keys: ["中方食堂", "食堂", "HJF KITCHEN", "KITCHEN"], persons: ["阳国友", "SUFYANTI"], std: "中方食堂", prefix: "HJF KITCHEN", project: "HF99999999999SSRS", line: "无生产线", type: "canteen", rank: 250 },
+  { keys: ["生产部", "PRODUKSI"], persons: ["Dandy"], std: "生产部", prefix: "PRODUKSI", project: "HF99999999999SSRS", line: "无生产线", type: "admin", rank: 260 },
+  { keys: ["中方行政", "现场人事行政", "行政部", "ADM TKA"], persons: ["张流", "沙海红"], std: "中方行政", prefix: "ADM TKA", project: "HF99999999999SSRS", line: "无生产线", type: "admin", rank: 270 },
+  { keys: ["印方后勤服务", "后勤服务部", "GA SERVICE TKI"], persons: ["Tiwin", "Prasetiyo"], std: "印方后勤服务", prefix: "GA SERVICE TKI", project: "HF99999999999SSRS", line: "无生产线", type: "admin", rank: 280 },
+  { keys: ["印方后勤维修", "后勤维修部", "GA MTC TKI"], persons: ["Stevaldo"], std: "印方后勤维修", prefix: "GA MTC TKI", project: "HF99999999999SSRS", line: "无生产线", type: "admin", rank: 290 },
+  { keys: ["后勤运输", "后勤运输部", "GA Transport"], persons: ["Nurlina"], std: "后勤运输", prefix: "GA Transport", project: "HF99999999999SSRS", line: "无生产线", type: "admin", rank: 300 },
+  { keys: ["印方人事", "HR TKI", "人事部"], persons: ["Ryan"], std: "印方人事", prefix: "HR TKI", project: "HF99999999999SSRS", line: "无生产线", type: "admin", rank: 310 },
+  { keys: ["IT部门", "信息部", "IT"], persons: [], std: "IT", prefix: "IT", project: "HF99999999999SSIG", line: "无生产线", type: "admin", rank: 320 }
+];
+
+// 明确排除的非 HJF 人员或部门
+const EXCLUDED_PERSONS = ["王雷"];
+const EXCLUDED_DEPTS = ["FINANCE TKI", "印方财务", "KPS", "OST"];
+
+// 广义办公用品（办公室/教室日常文具、纸品、桌面收纳、打印耗材、白板教具等）
+const OFFICE_KW = [
+  // 书写工具
+  "记号笔", "油性笔", "大头笔", "圆珠笔", "中性笔", "签字笔", "白板笔", "荧光笔", "铅笔", "自动铅笔", "钢笔", "水彩笔", "粉笔", "笔芯", "替换芯", "笔袋", "笔盒", "笔筒", "文具盒",
+  // 纸品本册
+  "A4纸", "A3纸", "A5纸", "F4纸", "B5纸", "复印纸", "打印纸", "相片纸", "热敏纸", "收银纸", "复写纸", "标签纸", "不干胶纸", "便签", "便利贴", "笔记本", "记录本", "台账本", "交接班本", "登记本", "账本", "作业本", "草稿纸", "信封", "稿纸", "考勤表", "报销单", "入库单", "出库单",
+  // 桌面文具与粘合修正
+  "透明胶带", "封箱胶带", "透明胶", "文具胶带", "双面胶", "美纹纸胶带", "胶水", "胶棒", "固体胶", "液体胶", "白乳胶", "修正带", "修正液", "涂改液", "橡皮", "削笔器", "卷笔刀", "直尺", "三角尺", "量角器", "圆规", "美工刀", "裁纸刀", "办公剪刀", "剪刀", "切割垫", "垫板", "书写板", "写字板", "板夹",
+  // 文件归档与装订
+  "文件夹", "文件袋", "文件盒", "文件框", "文件架", "文件盘", "文件柜", "档案袋", "档案盒", "资料册", "资料夹", "抽杆夹", "快劳夹", "强力夹", "长尾夹", "燕尾夹", "票夹", "回形针", "曲别针", "大头针", "图钉", "工字钉", "订书机", "订书钉", "起钉器", "打孔机", "装订机", "装订环", "装订夹", "过塑机", "过塑膜", "护卡膜", "名片盒", "名片册", "索引贴", "分页纸", "拉链袋", "按扣袋", "风琴包",
+  // 教学白板与办公设备耗材
+  "白板", "白板擦", "黑板擦", "磁钉", "磁扣", "磁贴", "软磁条", "计算器", "印泥", "印台", "印章", "印油", "号码机", "碳粉", "墨粉", "墨盒", "墨水", "硒鼓", "色带", "打印纸", "碎纸机", "鼠标", "键盘", "鼠标垫", "U盘", "插排", "插座", "桌面收纳", "收纳盒", "台历", "挂历", "工牌", "证件卡套", "挂绳"
+];
+// 排除工业耗材与五金工具，防止误入办公用品
+const OFFICE_EXCLUDE = [
+  "电工胶带", "绝缘胶带", "高压胶带", "生料带", "四氟带", "玻璃胶", "结构胶", "PVC胶", "AB胶", "耐高温胶带", "警示胶带", "防滑胶带", "铝箔胶带", "修补胶", "螺纹锁固胶", "厌氧胶", "502",
+  "卷尺", "游标卡尺", "千分尺", "水平尺", "塞尺", "深度尺", "角度尺", "铁皮剪", "钢筋剪", "管子剪", "电缆剪", "工业插座", "航空插头", "防爆插座"
+];
+
+// 广义劳保用品（劳保商店常见个人防护 PPE 全品类）
+const LABOR_KW = [
+  // 手部防护（覆盖尼龙晴手套、丁腈、点塑、浸胶、线手套、焊工、耐高温、防割、绝缘、防化等）
+  "手套",
+  // 呼吸防护（覆盖呼吸器、防毒/防尘面具、各类口罩、滤毒盒、滤棉等）
+  "呼吸器", "口罩", "防毒面具", "防尘面具", "防毒半面罩", "全面罩", "滤毒盒", "滤毒罐", "滤棉", "防尘棉", "呼吸阀",
+  // 头部与眼面部防护
+  "安全帽", "帽衬", "下颌带", "防撞帽", "工作帽", "防尘帽", "披肩帽", "电焊面罩", "防护面罩", "面屏", "防护面屏", "护目镜", "防护眼镜", "防风镜", "防飞溅眼镜", "电焊眼镜", "电焊镜片", "洗眼液",
+  // 听觉防护
+  "耳塞", "耳罩",
+  // 足部防护
+  "劳保鞋", "安全鞋", "防砸鞋", "防穿刺鞋", "绝缘鞋", "耐高温鞋", "防静电鞋", "电焊鞋", "防滑鞋", "雨鞋", "水鞋", "套鞋", "胶鞋", "劳保靴", "绝缘靴", "鞋套",
+  // 躯干与高空防护
+  "工作服", "工装", "连体服", "防护服", "防化服", "防酸碱服", "防静电服", "阻燃服", "隔热服", "铝箔服", "电焊服", "防火服", "反光背心", "反光衣", "反光马甲", "反光条", "雨衣", "雨裤", "安全带", "安全绳", "防坠器", "速差器", "缓冲包", "防暑",
+  // 肢体局部防护
+  "护腕", "护膝", "护肘", "护腿", "脚盖", "皮围裙", "耐酸碱围裙", "电焊围裙", "防割袖套", "电焊袖套", "防护袖套", "袖套", "劳保"
+];
+// 排除非劳保品（避免误伤工具或机械部件）
+const LABOR_EXCLUDE = [
+  "手电钻", "角磨机", "电锤", "切割机", "电焊机", "电动扳手", "手拉葫芦", "手推车", "手锯", "手动黄油枪", "手套箱", "医用口罩", "手术口罩", "氧气面罩"
+];
+
+const MEDICAL_KW = [
+  "试剂", "试纸", "血清", "培养基", "琼脂", "采血管", "比色皿", "登革热", "肝炎", "梅毒", "艾滋", "破伤风",
+  "毒品检测", "补充剂", "药品", "注射", "针筒", "针头", "输液", "纱布", "绷带", "碘伏", "医用酒精", "75%酒精",
+  "体温计", "血压计", "听诊器", "急救", "医用", "医疗", "创可贴", "棉签", "压舌板", "雾化", "氧气面罩", "处方"
+];
+
+const LIVING_KW = ["枕头", "被子", "床单", "被套", "凉席", "蚊帐", "洗漱", "毛巾", "牙刷", "牙膏", "沐浴露", "洗发水", "洗衣粉", "洗衣液", "香皂", "脸盆", "衣架", "拖鞋", "卫生纸", "抽纸", "卷纸"];
+
+const CANTEEN_KW = ["餐盒", "筷子", "勺子", "碗", "盘子", "锅", "菜刀", "砧板", "保鲜膜", "保鲜袋", "厨师", "围裙", "洗洁精", "百洁布", "钢丝球", "食堂"];
+
+const OIL_CODES = new Set(["05000044782", "05000098840", "05000131437"]);
+const OIL_KW = ["齿轮油", "润滑油", "液压油", "机油", "黄油", "锂基脂", "润滑脂", "导热油", "变压器油", "空压机油", "抗磨液压油", "防冻液"];
+const OIL_EXCLUDE = ["油漆", "油管", "油封", "油桶", "油壶", "加油枪", "黄油枪", "滤油", "油水分离", "油刷", "油性笔", "除油剂", "松动剂", "自喷漆", "防锈漆", "底漆", "面漆", "沥青漆"];
+
+const LARGE_STEEL_KW = ["工字钢", "槽钢", "角钢", "H型钢", "钢板", "花纹板", "无缝钢管", "焊管", "圆钢", "螺纹钢", "方管", "矩形管", "轨道钢", "扁钢"];
+
+const GAS_KW = ["氧气", "乙炔", "二氧化碳", "氮气", "氩气", "液氧", "液氮", "混合气"];
+
+// 辅料仓全套归类（严格按 v2.9.2 档案包）
+const AUX_PROD_KW = ["绿泥", "电极糊", "脱模剂", "铸铁模", "镁质炮泥", "炮泥", "铁沟料", "保温碳化稻壳", "稻壳", "铁沟料添加剂", "镁碳砖", "高铝砖"];
+const AUX_LONG_ASSET_KW = ["吨包袋", "吹氧管", "地包浇注料", "浇注料", "钻头", "钻杆", "取样瓢", "取样杆", "石棉绳", "玻璃丝加强硅酸铝纤维布", "快速测温热电偶", "快换接头", "泡泥烘箱", "连接体"];
+const AUX_PROJECT_KW = ["地包锚固钩", "硅酸铝纤维毡", "锚固钉", "耐火纤维"];
+
+// P3 / GD1 分层匹配词典：固定型号禁止模糊，通用日杂允许名称模糊
+const STRICT_SPEC_KW = ["扳手", "螺栓", "螺母", "垫片", "螺丝", "螺钉", "阀门", "球阀", "闸阀", "截止阀", "蝶阀", "法兰", "弯头", "三通", "接头", "轴承", "油封", "密封圈", "钻头", "钢管", "角钢", "槽钢", "工字钢", "钢板", "圆钢", "电缆", "电线", "开关", "断路器", "接触器", "继电器", "电机", "马达", "皮带", "链条", "滤芯", "仪表", "压力表", "热电偶", "焊条", "焊丝", "切割片", "磨光片"];
+const FUZZY_GENERAL_KW = ["笔", "本", "纸", "胶带", "胶水", "固体胶", "双面胶", "文件夹", "档案", "夹", "订书", "手套", "口罩", "安全帽", "雨衣", "雨鞋", "扫把", "拖把", "垃圾袋", "抹布", "擦机布", "毛巾", "洗洁精", "洗衣", "香皂", "铁丝网", "编织袋", "扎带", "记号笔", "白板"];
+
+// 仓库排序（严格按 v2.9.2 ranking.json：通用→综合→配件→辅料→GD1→P3→空白/不在账）
+const WH_RANK = [
+  { kw: "通用仓", rank: 10 },
+  { kw: "综合仓", rank: 20 },
+  { kw: "配件仓", rank: 30 },
+  { kw: "辅料仓长期资产领用", rank: 40 },
+  { kw: "辅料仓生产领用", rank: 42 },
+  { kw: "辅料仓一般工程领用", rank: 44 },
+  { kw: "辅料仓", rank: 46 },
+  { kw: "GD1", rank: 50 },
+  { kw: "P3二层", rank: 65 },
+  { kw: "P3", rank: 60 },
+  { kw: "206", rank: 70 },
+  { kw: "207", rank: 75 },
+  { kw: "不在账", rank: 90 }
+];
+
+function getWarehouseRank(wh) {
+  const s = String(wh || "").trim();
+  if (!s) return 85;
+  for (const item of WH_RANK) {
+    if (s.includes(item.kw)) return item.rank;
+  }
+  return 80;
+}
+
+function getGroupOrder(row) {
+  const sp = String(row.special || "");
+  const pk = String(row.pickup || "");
+  if (sp.includes("大修") || row.project === "HFG250001NC4#9999") return 60;
+  if (pk.includes("已领取") || pk.includes("补单")) return 50;
+  if (pk.includes("自取")) return 40;
+  if (sp.includes("油脂")) return 30;
+  if (sp.includes("大型钢材")) return 20;
+  return 10;
+}
+
+function isPureNumericSpecialCode(val) {
+  const s = kText(val);
+  return /^\d{5,12}$/.test(s) && !/^20\d{6}$/.test(s);
+}
+
+// =========================================================================
+// 5. 文本清洗、日期解析与合并单元格展开
+// =========================================================================
+function kText(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
+}
+
+function cleanHeaderKey(v) {
+  return kText(v).replace(/[\r\n\s:：()（）【】\[\]]+/g, "");
+}
+
+function formatDateIso(y, m, d) {
+  const yy = String(y).padStart(4, "0");
+  const mm = String(m).padStart(2, "0");
+  const dd = String(d).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
+
+function pDate(v) {
+  if (v === null || v === undefined || v === "") return "";
+  if (v instanceof Date && !isNaN(v.getTime())) {
+    return formatDateIso(v.getFullYear(), v.getMonth() + 1, v.getDate());
+  }
+  if (typeof v === "number" && v > 30000 && v < 70000) {
+    const dt = new Date(Math.round((v - 25569) * 86400 * 1000));
+    if (!isNaN(dt.getTime())) {
+      return formatDateIso(dt.getUTCFullYear(), dt.getUTCMonth() + 1, dt.getUTCDate());
+    }
+  }
+  const s = kText(v);
+  if (!s) return "";
+  let m = s.match(/(20\d{2})[年\/\-\.](\d{1,2})[月\/\-\.](\d{1,2})/);
+  if (m) return formatDateIso(m[1], m[2], m[3]);
+  m = s.match(/^(\d{1,2})[月\/\-\.](\d{1,2})$/);
+  if (m) {
+    const baseYear = (document.getElementById("dateInput")?.value || "").slice(0, 4) || String(new Date().getFullYear());
+    return formatDateIso(baseYear, m[1], m[2]);
+  }
+  return "";
+}
+
+function sheetToMatrixWithMerges(ws) {
+  if (!ws || !ws["!ref"]) return [];
+  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true });
+  const range = XLSX.utils.decode_range(ws["!ref"]);
+  const merges = ws["!merges"] || [];
+  for (const mg of merges) {
+    const r0 = mg.s.r - range.s.r;
+    const c0 = mg.s.c - range.s.c;
+    const r1 = mg.e.r - range.s.r;
+    const c1 = mg.e.c - range.s.c;
+    if (r0 < 0 || c0 < 0 || !raw[r0]) continue;
+    const val = raw[r0][c0];
+    if (val === "" || val === undefined || val === null) continue;
+    for (let r = Math.max(0, r0); r <= Math.min(raw.length - 1, r1); r++) {
+      if (!raw[r]) raw[r] = [];
+      for (let c = Math.max(0, c0); c <= c1; c++) {
+        if (raw[r][c] === "" || raw[r][c] === undefined || raw[r][c] === null) {
+          raw[r][c] = val;
+        }
+      }
+    }
+  }
+  return raw;
+}
+
+// =========================================================================
+// 6. P3 / GD1 现存量独立导入与分层匹配引擎（精确编码 + 日杂名称模糊）
+// =========================================================================
+function rebuildPgMap() {
+  pgMap = new Map();
+  pgList = [];
+  const addItems = (arr, sourceTag) => {
+    for (const it of (arr || [])) {
+      const code = kText(it.code);
+      if (!code) continue;
+      const itemObj = {
+        code,
+        name: kText(it.name),
+        spec: kText(it.spec),
+        wh: kText(it.wh) || sourceTag,
+        qty: kText(it.qty),
+        tag: sourceTag
+      };
+      pgList.push(itemObj);
+      if (!pgMap.has(code)) {
+        pgMap.set(code, itemObj);
+      }
+    }
+  };
+  addItems(gd1Items, "GD1");
+  addItems(p3Items, "P3");
+  const badge = document.getElementById("pgBadge");
+  if (badge) {
+    badge.textContent = `P3/GD1库存: ${pgMap.size} 条 (P3:${p3Items.length} / GD1:${gd1Items.length})`;
+  }
+}
+
+function normMatchText(s) {
+  return kText(s).toLowerCase().replace(/[\s\-_\/\\()（）【】\[\],，.。]+/g, "");
+}
+
+function findPgMatch(code, fullName, rawName, rawSpec) {
+  if (code && pgMap.has(code)) {
+    return pgMap.get(code);
+  }
+  if (!pgList.length || !fullName) return null;
+
+  const isStrict = STRICT_SPEC_KW.some(k => fullName.includes(k));
+  const isFuzzyAllowed = !isStrict && FUZZY_GENERAL_KW.some(k => fullName.includes(k));
+  const targetNameNorm = normMatchText(rawName || fullName);
+  const targetSpecNorm = normMatchText(rawSpec || "");
+  const targetFullNorm = normMatchText(fullName);
+
+  if (isStrict) {
+    for (const it of pgList) {
+      if (!it.name) continue;
+      const itFullNorm = normMatchText(`${it.name}${it.spec}`);
+      if (itFullNorm && itFullNorm === targetFullNorm) return it;
+      if (targetSpecNorm && normMatchText(it.name) === targetNameNorm && normMatchText(it.spec) === targetSpecNorm) {
+        return it;
+      }
+    }
+    return null;
+  }
+
+  if (isFuzzyAllowed && targetNameNorm.length >= 2) {
+    for (const it of pgList) {
+      if (!it.name) continue;
+      const itNameNorm = normMatchText(it.name);
+      if (itNameNorm && (itNameNorm.includes(targetNameNorm) || targetNameNorm.includes(itNameNorm))) {
+        return it;
+      }
+    }
+  }
+  return null;
+}
+
+async function handlePgFileUpload(file, tag) {
+  if (!file) return;
+  try {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: "array" });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+    let codeCol = -1, nameCol = -1, specCol = -1, whCol = -1, qtyCol = -1, startRow = 0;
+
+    for (let r = 0; r < Math.min(rows.length, 25); r++) {
+      const row = rows[r] || [];
+      for (let c = 0; c < row.length; c++) {
+        const h = cleanHeaderKey(row[c]);
+        if (codeCol < 0 && (h.includes("物料编码") || h.includes("存货编码") || h === "编码")) codeCol = c;
+        if (nameCol < 0 && (h.includes("物料名称") || h.includes("存货名称") || h.includes("物资名称") || h === "品名" || h === "名称")) nameCol = c;
+        if (specCol < 0 && (h.includes("规格") || h.includes("型号"))) specCol = c;
+        if (whCol < 0 && (h.includes("仓库") || h.includes("库位") || h.includes("货位"))) whCol = c;
+        if (qtyCol < 0 && (h.includes("现存量") || h.includes("结存") || h.includes("库存数量") || h === "数量")) qtyCol = c;
+      }
+      if (codeCol >= 0) {
+        startRow = r + 1;
+        break;
+      }
+    }
+    if (codeCol < 0) {
+      for (let r = 0; r < Math.min(rows.length, 30); r++) {
+        for (let c = 0; c < (rows[r] || []).length; c++) {
+          if (/^0[1-9]\d{7,12}$/.test(kText(rows[r][c]))) {
+            codeCol = c;
+            startRow = r;
+            break;
+          }
+        }
+        if (codeCol >= 0) break;
+      }
+    }
+
+    const parsed = [];
+    const seen = new Set();
+    if (codeCol >= 0) {
+      for (let r = startRow; r < rows.length; r++) {
+        const row = rows[r] || [];
+        const code = kText(row[codeCol]);
+        if (!code || seen.has(code)) continue;
+        const qtyRaw = qtyCol >= 0 ? kText(row[qtyCol]) : "";
+        if (qtyRaw !== "" && !isNaN(Number(qtyRaw)) && Number(qtyRaw) <= 0) continue;
+        seen.add(code);
+        const name = nameCol >= 0 ? kText(row[nameCol]) : "";
+        const spec = specCol >= 0 ? kText(row[specCol]) : "";
+        const wh = whCol >= 0 ? kText(row[whCol]) : tag;
+        parsed.push({ code, name, spec, wh: wh || tag, qty: qtyRaw, tag });
+      }
+    }
+
+    if (tag === "P3") p3Items = parsed;
+    else gd1Items = parsed;
+
+    rebuildPgMap();
+    persistAllState(true);
+    showToast(`${tag} 现存量已导入 ${parsed.length} 条有效库存，当前共合并 ${pgMap.size} 条`);
+  } catch (err) {
+    console.error(err);
+    showToast(`解析 ${tag} 现存量表失败`);
+  }
+}
+
+// =========================================================================
+// 7. 两级表头检测（支持标准表头 + 无表头形态反推 + 多列自适应备注抓取）
+// =========================================================================
+function detectHeaderAndCols(matrix) {
+  let headerRow = -1;
+  const cols = {
+    date: -1, dept: -1, person: -1, warehouse: -1, code: -1,
+    name: -1, spec: -1, qty: -1, unit: -1, remark: -1,
+    remarkCols: [], fallbackTextCols: [],
+    usageCode: -1, project: -1, subitem: -1, pickup: -1, special: -1
+  };
+
+  for (let r = 0; r < Math.min(matrix.length, 50); r++) {
+    const row = matrix[r] || [];
+    const temp = {
+      date: -1, dept: -1, person: -1, warehouse: -1, code: -1,
+      name: -1, spec: -1, qty: -1, unit: -1, remark: -1,
+      remarkCols: [], fallbackTextCols: [],
+      usageCode: -1, project: -1, subitem: -1, pickup: -1, special: -1
+    };
+    const coreUsed = new Set();
+    let score = 0;
+
+    for (let c = 0; c < row.length; c++) {
+      const h = cleanHeaderKey(row[c]);
+      if (!h) continue;
+      if (temp.code < 0 && (h.includes("物料编码") || h.includes("物资编码") || h.includes("存货编码") || h === "编码" || h === "代码" || h.includes("MaterialCode"))) {
+        temp.code = c; coreUsed.add(c); score += 3;
+      } else if (temp.name < 0 && (h.includes("物资名称") || h.includes("物料名称") || h.includes("存货名称") || h === "品名" || h === "名称" || h.includes("MaterialName"))) {
+        temp.name = c; coreUsed.add(c); score += 3;
+      } else if (temp.spec < 0 && (h.includes("规格") || h.includes("型号") || h.includes("Spec"))) {
+        temp.spec = c; coreUsed.add(c); score += 1;
+      } else if (temp.qty < 0 && (h.includes("数量") || h.includes("申领数") || h.includes("领用数") || h === "Qty")) {
+        temp.qty = c; coreUsed.add(c); score += 2;
+      } else if (temp.unit < 0 && (h.includes("单位") || h === "Unit")) {
+        temp.unit = c; coreUsed.add(c); score += 1;
+      } else if (temp.warehouse < 0 && (h.includes("仓库") || h.includes("库房") || h.includes("库别") || h.includes("发料仓"))) {
+        temp.warehouse = c; coreUsed.add(c); score += 1;
+      } else if (temp.person < 0 && (h.includes("领料人") || h.includes("申请人") || h.includes("提报人") || h.includes("领用人"))) {
+        temp.person = c; coreUsed.add(c); score += 1;
+      } else if (temp.dept < 0 && (h.includes("车间") || h.includes("部门") || h.includes("班组") || h.includes("单位部门"))) {
+        temp.dept = c; coreUsed.add(c); score += 1;
+      } else if (temp.date < 0 && (h.includes("日期") || h.includes("时间") || h === "Date")) {
+        temp.date = c; coreUsed.add(c); score += 1;
+      } else if (h.includes("项目号")) {
+        if (temp.project < 0) temp.project = c;
+        coreUsed.add(c);
+      } else if (h.includes("子项")) {
+        if (temp.subitem < 0) temp.subitem = c;
+        coreUsed.add(c);
+      } else if (h.includes("自取") || h.includes("补单")) {
+        if (temp.pickup < 0) temp.pickup = c;
+        coreUsed.add(c);
+      } else if (h.includes("特殊情况") || h === "特殊") {
+        if (temp.special < 0) temp.special = c;
+        coreUsed.add(c);
+      } else if (
+        h.includes("备注") || h.includes("用途") || h.includes("位置") || h.includes("部位") ||
+        h.includes("地点") || h.includes("说明") || h.includes("原因") || h.includes("内容") ||
+        h.includes("设备") || h.includes("车号") || h.includes("车型") || h.includes("工程") ||
+        h.includes("特殊编码") || h.includes("去向") || h.includes("工号") || h.includes("位号") ||
+        h.includes("区域") || h.includes("炉号") || h.includes("窑号") || h.includes("项目名称") ||
+        /REMARK|NOTE|USAGE|PURPOSE|KETERANGAN|LOKASI|PEMAKAIAN/i.test(h)
+      ) {
+        temp.remarkCols.push(c);
+        if (temp.remark < 0) temp.remark = c;
+        if (temp.usageCode < 0 && (h.includes("特殊编码") || h.includes("使用位置") || h.includes("位置编码") || h.includes("设备编码"))) {
+          temp.usageCode = c;
+        }
+        coreUsed.add(c);
+        score += 1;
+      } else if (
+        h === "序号" || h === "No" || h === "NO" || h === "编号" ||
+        h.includes("单价") || h.includes("金额") || h.includes("现存量") || h.includes("库存") ||
+        h.includes("收支项目") || h.includes("生产线") || h.includes("状态") || h.includes("审批")
+      ) {
+        coreUsed.add(c);
+      }
+    }
+
+    if ((temp.code >= 0 && temp.name >= 0) || (score >= 6 && (temp.code >= 0 || temp.name >= 0))) {
+      // 扫描数据区最大列宽（防止机修等表在表头之后有无表头的备注列被遗漏）
+      let maxColLen = row.length;
+      for (let rr = r + 1; rr < Math.min(matrix.length, r + 40); rr++) {
+        if ((matrix[rr] || []).length > maxColLen) maxColLen = matrix[rr].length;
+      }
+      for (let c = 0; c < maxColLen; c++) {
+        if (!coreUsed.has(c)) {
+          temp.fallbackTextCols.push(c);
+        }
+      }
+      headerRow = r;
+      Object.assign(cols, temp);
+      break;
+    }
+  }
+
+  if (headerRow < 0) {
+    const colStats = {};
+    const maxCols = Math.min(25, Math.max(...matrix.slice(0, 80).map(r => (r || []).length), 0));
+    for (let c = 0; c < maxCols; c++) {
+      colStats[c] = { codeHits: 0, dateHits: 0, numHits: 0, unitHits: 0, whHits: 0, cnTextHits: 0, avgLen: 0, nonEmpty: 0 };
+    }
+    const unitSet = new Set(["个", "件", "套", "台", "只", "根", "米", "m", "kg", "KG", "吨", "t", "T", "箱", "包", "袋", "桶", "瓶", "盒", "卷", "把", "张", "块", "条", "副", "双", "升", "L", "支", "片", "组", "批", "捆"]);
+
+    let firstCodeRow = -1;
+    for (let r = 0; r < Math.min(matrix.length, 100); r++) {
+      const row = matrix[r] || [];
+      for (let c = 0; c < maxCols; c++) {
+        const s = kText(row[c]);
+        if (!s) continue;
+        const st = colStats[c];
+        st.nonEmpty++;
+        st.avgLen += s.length;
+        if (/^0[1-9]\d{6,12}$/.test(s) || (/^\d{8,13}$/.test(s) && !/^20\d{6}$/.test(s))) {
+          st.codeHits++;
+          if (firstCodeRow < 0) firstCodeRow = r;
+        }
+        if (pDate(row[c])) st.dateHits++;
+        if (/^\d+(\.\d+)?$/.test(s) && Number(s) > 0 && Number(s) < 100000 && !/^0\d{4,}$/.test(s)) st.numHits++;
+        if (unitSet.has(s)) st.unitHits++;
+        if (/(通用仓|综合仓|辅料仓|配件仓|GD1|P3|206|207)/.test(s)) st.whHits++;
+        if (/[\u4e00-\u9fa5]{2,}/.test(s) && !/(通用仓|综合仓|辅料仓|配件仓)/.test(s)) st.cnTextHits++;
+      }
+    }
+
+    const pickBest = (field, excludeCols) => {
+      let bestC = -1, bestV = 0;
+      for (let c = 0; c < maxCols; c++) {
+        if (excludeCols.includes(c)) continue;
+        if (colStats[c][field] > bestV) {
+          bestV = colStats[c][field];
+          bestC = c;
+        }
+      }
+      return bestV > 0 ? bestC : -1;
+    };
+
+    const used = [];
+    cols.code = pickBest("codeHits", used); if (cols.code >= 0) used.push(cols.code);
+    cols.date = pickBest("dateHits", used); if (cols.date >= 0) used.push(cols.date);
+    cols.unit = pickBest("unitHits", used); if (cols.unit >= 0) used.push(cols.unit);
+    cols.warehouse = pickBest("whHits", used); if (cols.warehouse >= 0) used.push(cols.warehouse);
+
+    if (cols.unit > 0 && colStats[cols.unit - 1]?.numHits > 0 && !used.includes(cols.unit - 1)) {
+      cols.qty = cols.unit - 1;
+      used.push(cols.qty);
+    } else {
+      cols.qty = pickBest("numHits", used);
+      if (cols.qty >= 0) used.push(cols.qty);
+    }
+
+    if (cols.code >= 0 && colStats[cols.code + 1]?.cnTextHits > 0 && !used.includes(cols.code + 1)) {
+      cols.name = cols.code + 1;
+      used.push(cols.name);
+    } else {
+      cols.name = pickBest("cnTextHits", used);
+      if (cols.name >= 0) used.push(cols.name);
+    }
+
+    cols.remark = pickBest("cnTextHits", used);
+    if (cols.remark >= 0) cols.remarkCols = [cols.remark];
+
+    if (cols.code >= 0 && cols.name >= 0) {
+      return { headerRow: -1, dataStartRow: Math.max(0, firstCodeRow), cols, isHeaderless: true };
+    }
+    return { headerRow: -1, dataStartRow: 0, cols, isHeaderless: false, failed: true };
+  }
+
+  return { headerRow, dataStartRow: headerRow + 1, cols, isHeaderless: false, failed: false };
+}
+
+function resolveDeptConfig(rawDept, rawPerson = "") {
+  const s = kText(rawDept);
+  const p = kText(rawPerson);
+
+  // 1. 最高优先级：用户通过维护弹窗保存的自定义领料人映射
+  if (p && customPersonMaps.length > 0) {
+    const pUp = p.toUpperCase();
+    for (const cm of customPersonMaps) {
+      if (cm.person && pUp.includes(cm.person.toUpperCase())) {
+        const base = DEPT_MAPS.find(d => d.std === cm.std) || {};
+        return {
+          std: cm.std,
+          prefix: cm.prefix !== undefined ? cm.prefix : (base.prefix || ""),
+          project: cm.project || base.project || "HF999999999NT9999",
+          line: cm.line || base.line || "镍铁冶炼共用",
+          type: cm.type || base.type || "prod",
+          rank: base.rank || 500,
+          _personMatched: true,
+          _deptMatched: true
+        };
+      }
+    }
+  }
+
+  // 2. 第二优先级：按标准领料人姓名强制锁定部门（防止行内“1#电炉”等使用地点覆盖“环境部”）
+  if (p) {
+    const pUp = p.toUpperCase();
+    for (const dm of DEPT_MAPS) {
+      for (const pname of (dm.persons || [])) {
+        if (pUp.includes(pname.toUpperCase())) {
+          return { ...dm, _personMatched: true, _deptMatched: true };
+        }
+      }
+    }
+  }
+
+  // 3. 第三优先级：领料人未命中对照表时，按部门文本匹配（忽略维修车间纯数字编码）
+  if (s && !isPureNumericSpecialCode(s)) {
+    const sUp = s.toUpperCase();
+    for (const dm of DEPT_MAPS) {
+      for (const kw of dm.keys) {
+        if (sUp.includes(kw.toUpperCase())) {
+          return { ...dm, std: dm.std || s, _personMatched: false, _deptMatched: true };
+        }
+      }
+    }
+  }
+
+  // 4. 兜底返回
+  const cleanDept = isPureNumericSpecialCode(s) ? "" : s;
+  return { std: cleanDept, prefix: "", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 999, _personMatched: false, _deptMatched: false };
+}
+
+function extractSheetMeta(matrix, headerRow, sheetName, fileName, cols) {
+  let metaDate = "";
+  let metaDept = "";
+  let metaPerson = "";
+  const scanLimit = headerRow > 0 ? headerRow : Math.min(matrix.length, 8);
+
+  for (let r = 0; r < scanLimit; r++) {
+    const row = matrix[r] || [];
+    for (let c = 0; c < row.length; c++) {
+      const s = kText(row[c]);
+      if (!s) continue;
+      if (!metaDate) {
+        const d = pDate(row[c]);
+        if (d) metaDate = d;
+      }
+      if (!metaPerson) {
+        const mp = s.match(/(?:领料人|申请人|提报人|领用人)[：:\s]+([^\s，,；;]+)/);
+        if (mp && mp[1]) metaPerson = mp[1];
+        else if (/^(?:领料人|申请人|提报人)[：:]?$/.test(s) && row[c + 1]) {
+          metaPerson = kText(row[c + 1]);
+        }
+      }
+      if (!metaDept) {
+        const md = s.match(/(?:领料部门|申请部门|申报部门|部门|车间)[：:\s]+([^\s，,；;]+)/);
+        if (md && md[1] && !isPureNumericSpecialCode(md[1])) metaDept = md[1];
+      }
+    }
+  }
+
+  if (!metaPerson && cols && cols.person >= 0) {
+    const startR = headerRow >= 0 ? headerRow + 1 : 0;
+    for (let r = startR; r < Math.min(matrix.length, startR + 20); r++) {
+      const pv = kText((matrix[r] || [])[cols.person]);
+      if (pv) { metaPerson = pv; break; }
+    }
+  }
+
+  if (!metaDept) {
+    const titleStr = `${fileName} ${sheetName}`.toUpperCase();
+    for (const dm of DEPT_MAPS) {
+      for (const kw of dm.keys) {
+        if (titleStr.includes(kw.toUpperCase())) {
+          metaDept = dm.std;
+          break;
+        }
+      }
+      if (metaDept) break;
+    }
+  }
+
+  if (!metaDept && metaPerson) {
+    const byPerson = resolveDeptConfig("", metaPerson);
+    if (byPerson.std) metaDept = byPerson.std;
+  }
+
+  return { metaDate, metaDept, metaPerson };
+}
+
+function formatPersonWithPrefix(rawPerson, deptCfg, pickupFlag) {
+  let p = kText(rawPerson);
+  // 仓储物流部只写纯中文姓名，不加任何英文前缀
+  if (deptCfg && deptCfg.type === "warehouse_dept") {
+    p = p.replace(/^(?:WAREHOUSE|LOGISTIK|LOGISTICS)\s+/i, "").trim();
+  } else if (deptCfg && deptCfg.prefix) {
+    const pref = deptCfg.prefix.trim();
+    if (!p) {
+      p = pref;
+    } else if (!p.toUpperCase().startsWith(pref.toUpperCase())) {
+      // 仅检查是否已包含当前部门前缀，避免带空格英文/印尼人名漏加前缀
+      p = `${pref} ${p}`;
+    }
+  }
+  if (pickupFlag === "自取" && !p.includes("自取")) p = `${p} 自取`.trim();
+  else if (pickupFlag === "补单" && !p.includes("补单")) p = `${p} 补单`.trim();
+  return p;
+}
+
+function mergeNameAndSpec(rawName, rawSpec) {
+  const n = kText(rawName);
+  const sp = kText(rawSpec);
+  if (!sp) return n;
+  if (!n) return sp;
+  if (sp.includes(n)) return sp;
+  if (n.includes(sp)) return n;
+  return `${n} ${sp}`;
+}
+
+function cleanRemark(rawRemark, deptStd) {
+  let r = kText(rawRemark);
+  if (!r) return "";
+  if (deptStd) {
+    const escaped = deptStd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    r = r.replace(new RegExp(`^${escaped}[\\s：:、\\-]*`), "");
+  }
+  return r.trim();
+}
+
+// =========================================================================
+// 8. 单行物资归类与核算核心规则引擎
+// =========================================================================
+function classifyRow(raw, deptCfg, targetDate, origIdx) {
+  const code = kText(raw.code);
+  const fullName = mergeNameAndSpec(raw.name, raw.spec);
+  const qtyNum = Number(raw.qty);
+  const qtyStr = isNaN(qtyNum) ? kText(raw.qty) : String(qtyNum);
+  const unit = kText(raw.unit);
+  let wh = kText(raw.warehouse);
+  const remark = cleanRemark(raw.remark, deptCfg.std);
+  const allText = `${fullName} ${remark} ${raw.special || ""}`;
+
+  let project = kText(raw.project) || deptCfg.project || "HF999999999NT9999";
+  let line = deptCfg.line || "镍铁冶炼共用";
+  let usage = "其他综合物资";
+  let subject = "510107";
+  let pickupRaw = kText(raw.pickup);
+  const specials = [];
+  if (kText(raw.special)) specials.push(kText(raw.special));
+
+  let pickupFlag = "";
+  if (/补单|补领|补开/.test(pickupRaw) || /补单|补领|补开/.test(allText)) {
+    pickupFlag = "补单";
+  } else if (/自取|自提/.test(pickupRaw) || /自取|自提/.test(allText)) {
+    pickupFlag = "自取";
+  }
+  const pickupCol13 = pickupFlag === "补单" ? "已领取" : (pickupFlag === "自取" ? "自取" : pickupRaw);
+
+  const isOverhaul = /大修/.test(allText) || project === "HFG250001NC4#9999";
+  if (isOverhaul) {
+    project = "HFG250001NC4#9999";
+    if (!specials.includes("大修")) specials.push("大修");
+  }
+
+  // 广义劳保用品与办公用品判定（以物资名称为主，兼顾备注）
+  const isLabor = LABOR_KW.some(k => fullName.includes(k)) && !LABOR_EXCLUDE.some(k => fullName.includes(k));
+  const isOffice = !isLabor && OFFICE_KW.some(k => fullName.includes(k)) && !OFFICE_EXCLUDE.some(k => fullName.includes(k));
+  const isOil = OIL_CODES.has(code) || (OIL_KW.some(k => allText.includes(k)) && !OIL_EXCLUDE.some(k => allText.includes(k)));
+  const isMedical = (code.startsWith("070000") && !/(垃圾袋|清洁剂|扫把|拖把|填缝剂|洁厕|洗衣|洗洁精|笔筒|胶水|扳手|锁)/.test(fullName))
+    || MEDICAL_KW.some(k => allText.includes(k));
+  const isLiving = LIVING_KW.some(k => allText.includes(k));
+  const isCanteenItem = CANTEEN_KW.some(k => allText.includes(k));
+
+  // 维修车间专用纯数字特殊编码（严禁用于其他车间）
+  let maintSpecialCode = "";
+  if (deptCfg.type === "maint") {
+    if (isPureNumericSpecialCode(raw.usageCode)) maintSpecialCode = kText(raw.usageCode);
+    else if (isPureNumericSpecialCode(raw.rawDept)) maintSpecialCode = kText(raw.rawDept);
+    else {
+      const m = remark.match(/\b(\d{5,12})\b/);
+      if (m && !/^20\d{6}$/.test(m[1])) maintSpecialCode = m[1];
+    }
+  }
+
+  if (deptCfg.type === "clinic") {
+    if (isMedical && !isOffice && !isLabor) {
+      usage = "医疗物资";
+      subject = "660247";
+      project = "HF99999999999SSED";
+      line = "无生产线";
+    } else if (isLabor) {
+      usage = "劳保用品";
+      subject = "510129";
+    } else if (isOffice) {
+      usage = "办公用品";
+      subject = "51010301";
+    } else {
+      usage = "其他综合物资";
+      subject = "510107";
+    }
+  } else if (deptCfg.type === "maint") {
+    if (isLabor) {
+      usage = "劳保用品";
+      subject = "510129";
+    } else if (isOffice) {
+      usage = "办公用品";
+      subject = "51010301";
+    } else {
+      usage = maintSpecialCode || "其他综合物资";
+      subject = "51010605";
+    }
+  } else if (deptCfg.type === "canteen") {
+    if (isLabor) {
+      usage = "劳保用品";
+      subject = "660224";
+    } else if (isOffice) {
+      usage = "办公用品";
+      subject = "66020101";
+    } else if (isLiving) {
+      usage = "后勤生活物资";
+      subject = "660248";
+    } else {
+      usage = "食堂物资";
+      subject = "660246";
+    }
+  } else if (deptCfg.type === "admin") {
+    if (isLiving) {
+      usage = "后勤生活物资";
+      subject = "660248";
+    } else if (isCanteenItem) {
+      usage = "食堂物资";
+      subject = "660246";
+    } else if (isLabor) {
+      usage = "劳保用品";
+      subject = "660224";
+    } else if (isOffice) {
+      usage = "办公用品";
+      subject = "66020101";
+    } else if (isMedical) {
+      usage = "医疗物资";
+      subject = "660247";
+      project = "HF99999999999SSED";
+      line = "无生产线";
+    } else {
+      usage = "其他综合物资";
+      subject = "660206";
+    }
+  } else {
+    if (isLabor) {
+      usage = "劳保用品";
+      subject = "510129";
+    } else if (isOffice) {
+      usage = "办公用品";
+      subject = "51010301";
+    } else if (deptCfg.type === "auto" && !/灭火器|消防/.test(fullName) && (/维修车辆|修车|车修|装载机|铲车|叉车|挖机|自卸车|吊车|货车|汽修/.test(allText) || /P2汽修/.test(fileNameCache))) {
+      usage = "汽修";
+      subject = "51010606";
+    } else {
+      usage = "其他综合物资";
+      subject = "510107";
+    }
+  }
+
+  if (isOil) {
+    if (deptCfg.type !== "maint") usage = "其他综合物资";
+    if (deptCfg.type !== "admin" && deptCfg.type !== "canteen" && deptCfg.type !== "maint") subject = "510107";
+    if (!specials.includes("油脂")) specials.push("油脂");
+  }
+  if (LARGE_STEEL_KW.some(k => fullName.includes(k))) {
+    if (!specials.includes("大型钢材")) specials.push("大型钢材");
+  }
+
+  if (!wh && GAS_KW.some(k => fullName.includes(k))) {
+    wh = "不在账";
+  }
+
+  const isAuxEligible = !wh || wh.includes("辅料仓");
+  if (isAuxEligible) {
+    if (AUX_PROD_KW.some(k => fullName.includes(k))) {
+      wh = "辅料仓生产领用";
+    } else if (AUX_LONG_ASSET_KW.some(k => fullName.includes(k))) {
+      wh = "辅料仓长期资产领用";
+    } else if (AUX_PROJECT_KW.some(k => fullName.includes(k))) {
+      wh = "辅料仓一般工程领用";
+    }
+  }
+
+  if (code === "03000003120" || fullName.includes("电极糊")) {
+    if (!specials.includes("P8")) specials.push("P8");
+  }
+  if (code === "05000110977" || fullName.includes("20圆钢")) {
+    if (wh && !wh.includes("实物和入库都在P3")) wh += "（实物和入库都在P3）";
+    else if (!wh) wh = "P3（实物和入库都在P3）";
+    if (!specials.includes("实物和入库都在P3")) specials.push("实物和入库都在P3");
+  }
+  if (code === "06000000234" || code === "06000000323" || fullName.includes("吨包袋")) {
+    usage = "其他综合物资";
+    if (!isNaN(qtyNum) && qtyNum < 250) {
+      specials.push("⚠️数量低于250拦截");
+    }
+    specials.push("开单数量不能低于250；存放207仓二层集装箱内");
+  }
+  if (fullName.includes("吹氧管")) {
+    if (!specials.includes("一捆2.44吨2520米")) specials.push("一捆2.44吨2520米");
+  }
+
+  const pgHit = findPgMatch(code, fullName, raw.name, raw.spec);
+  if (pgHit) {
+    const tagStr = `（${pgHit.tag}:${pgHit.code}）`;
+    if (!wh) {
+      wh = `${pgHit.tag}${tagStr}`;
+    } else if (!wh.includes(pgHit.code)) {
+      wh = `${wh}${tagStr}`;
+    }
+  }
+
+  const personFormatted = formatPersonWithPrefix(raw.person, deptCfg, pickupFlag);
+
+  return {
+    _id: `${targetDate}|${deptCfg.std}|${personFormatted}|${code}|${qtyStr}|${origIdx}`,
+    date: targetDate,
+    dept: deptCfg.std,
+    person: personFormatted,
+    warehouse: wh,
+    code,
+    name: fullName,
+    qty: qtyStr,
+    unit,
+    project,
+    line,
+    usage,
+    subject,
+    remark,
+    pickup: pickupCol13,
+    special: specials.join("；"),
+    _deptRank: deptCfg.rank || 999,
+    _origIdx: origIdx,
+    _pgHit: !!pgHit
+  };
+}
+
+// =========================================================================
+// 9. 统一排序与组间分隔空行引擎（按部门序→仓库序→分组序；空行整行为空）
+// =========================================================================
+function sortAndInsertBlankRows(rows) {
+  const realRows = (rows || []).filter(r => r && !r._isBlank);
+  if (realRows.length === 0) return [];
+
+  const sorted = [...realRows].sort((a, b) => {
+    const ovA = getGroupOrder(a) === 60 ? 1 : 0;
+    const ovB = getGroupOrder(b) === 60 ? 1 : 0;
+    if (ovA !== ovB) return ovA - ovB;
+
+    if ((a.date || "") !== (b.date || "")) return (a.date || "").localeCompare(b.date || "");
+    const drA = a._deptRank || 999, drB = b._deptRank || 999;
+    if (drA !== drB) return drA - drB;
+    if ((a.dept || "") !== (b.dept || "")) return (a.dept || "").localeCompare(b.dept || "", "zh-CN");
+    if ((a.person || "") !== (b.person || "")) return (a.person || "").localeCompare(b.person || "", "zh-CN");
+    const wrA = getWarehouseRank(a.warehouse), wrB = getWarehouseRank(b.warehouse);
+    if (wrA !== wrB) return wrA - wrB;
+    const subNum = w => { const m = String(w || "").match(/GD1[\-（(](\d+)/i); return m ? parseInt(m[1], 10) : 999999; };
+    const snA = subNum(a.warehouse), snB = subNum(b.warehouse);
+    if (snA !== snB) return snA - snB;
+    const gA = getGroupOrder(a), gB = getGroupOrder(b);
+    if (gA !== gB) return gA - gB;
+    return (a._origIdx || 0) - (b._origIdx || 0);
+  });
+
+  const baseWhKey = wh => {
+    const s = String(wh || "").replace(/（[^）]*）/g, "").trim();
+    if (s.startsWith("GD1")) return "GD1";
+    if (s.startsWith("P3")) return "P3";
+    return s;
+  };
+
+  const out = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const cur = sorted[i];
+    if (i > 0) {
+      const prev = sorted[i - 1];
+      const changed = (
+        prev.date !== cur.date ||
+        prev.dept !== cur.dept ||
+        prev.person !== cur.person ||
+        baseWhKey(prev.warehouse) !== baseWhKey(cur.warehouse) ||
+        getGroupOrder(prev) !== getGroupOrder(cur)
+      );
+      if (changed) {
+        out.push({
+          _isBlank: true,
+          date: "", dept: "", person: "",
+          warehouse: "", code: "", name: "", qty: "", unit: "",
+          project: "", line: "", usage: "", subject: "", remark: "", pickup: "", special: ""
+        });
+      }
+    }
+    out.push(cur);
+  }
+  return out;
+}
+
+// =========================================================================
+// 10. 文件加载、工作表自动选择与一键核算主流程
+// =========================================================================
+function setStatusBox(type, htmlContent) {
+  const box = document.getElementById("statusBox");
+  if (!box) return;
+  box.classList.remove("hidden", "bg-rose-50", "border-rose-300", "text-rose-800", "bg-emerald-50", "border-emerald-300", "text-emerald-800", "bg-amber-50", "border-amber-300", "text-amber-900");
+  if (type === "error") box.classList.add("bg-rose-50", "border-rose-300", "text-rose-800");
+  else if (type === "warn") box.classList.add("bg-amber-50", "border-amber-300", "text-amber-900");
+  else box.classList.add("bg-emerald-50", "border-emerald-300", "text-emerald-800");
+  box.innerHTML = htmlContent;
+}
+
+function autoInspectSheet(sheetName) {
+  if (!wbCache || !sheetName) return;
+  const ws = wbCache.Sheets[sheetName];
+  const matrix = sheetToMatrixWithMerges(ws);
+  const det = detectHeaderAndCols(matrix);
+  const meta = extractSheetMeta(matrix, det.headerRow, sheetName, fileNameCache, det.cols);
+
+  const deptEl = document.getElementById("deptInput");
+  if (deptEl) deptEl.value = meta.metaDept || "";
+
+  let latestDate = meta.metaDate;
+  if (!det.failed && det.cols.date >= 0) {
+    for (let r = det.dataStartRow; r < matrix.length; r++) {
+      const d = pDate((matrix[r] || [])[det.cols.date]);
+      if (d && (!latestDate || d > latestDate)) latestDate = d;
+    }
+  }
+  if (latestDate && !document.getElementById("dateInput").value) {
+    document.getElementById("dateInput").value = latestDate;
+  }
+}
+
+function findBestSheetInWorkbook(wb) {
+  let bestSheet = wb.SheetNames[0] || "";
+  let bestScore = -1;
+  wb.SheetNames.forEach(name => {
+    const matrix = sheetToMatrixWithMerges(wb.Sheets[name]);
+    const det = detectHeaderAndCols(matrix);
+    const sc = (!det.failed ? 10 : 0) + Math.min(matrix.length, 50) / 10;
+    if (sc > bestScore) {
+      bestScore = sc;
+      bestSheet = name;
+    }
+  });
+  return bestSheet;
+}
+
+async function handleMainFileChange(e) {
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
+  try {
+    wbBatchCache = [];
+    for (const file of files) {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      const bestSheet = findBestSheetInWorkbook(wb);
+      wbBatchCache.push({ fileName: file.name, wb, bestSheet });
+    }
+
+    const first = wbBatchCache[0];
+    wbCache = first.wb;
+    fileNameCache = first.fileName;
+    const sel = document.getElementById("sheetSelect");
+    sel.innerHTML = "";
+
+    if (wbBatchCache.length === 1) {
+      first.wb.SheetNames.forEach(name => {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+      });
+      sel.value = first.bestSheet;
+      autoInspectSheet(first.bestSheet);
+      showToast(`已加载申报单：${first.fileName}（共 ${first.wb.SheetNames.length} 个工作表）`);
+    } else {
+      const opt = document.createElement("option");
+      opt.value = "__BATCH_AUTO__";
+      opt.textContent = `📦 批量连算模式（已选 ${wbBatchCache.length} 个车间文件，自动识别各表部门与子表）`;
+      sel.appendChild(opt);
+      sel.value = "__BATCH_AUTO__";
+      document.getElementById("deptInput").value = "";
+
+      // 自动探测整批文件里的最新日期
+      let batchLatestDate = "";
+      for (const item of wbBatchCache) {
+        const ws = item.wb.Sheets[item.bestSheet];
+        const matrix = sheetToMatrixWithMerges(ws);
+        const det = detectHeaderAndCols(matrix);
+        const meta = extractSheetMeta(matrix, det.headerRow, item.bestSheet, item.fileName, det.cols);
+        if (meta.metaDate && meta.metaDate > batchLatestDate) batchLatestDate = meta.metaDate;
+        if (!det.failed && det.cols.date >= 0) {
+          for (let r = det.dataStartRow; r < matrix.length; r++) {
+            const d = pDate((matrix[r] || [])[det.cols.date]);
+            if (d && d > batchLatestDate) batchLatestDate = d;
+          }
+        }
+      }
+      if (batchLatestDate) {
+        document.getElementById("dateInput").value = batchLatestDate;
+      }
+      showToast(`已批量加载 ${wbBatchCache.length} 个车间申报单文件，点击“▶ 一键核算”即可一次全部算完！`);
+    }
+  } catch (err) {
+    console.error(err);
+    setStatusBox("error", "❌ 无法读取 Excel 文件，请确认文件未损坏且为 .xlsx / .xls 格式。");
+  }
+}
+
+function quickSwitchDateAndRun(dateStr) {
+  document.getElementById("dateInput").value = dateStr;
+  runAudit();
+}
+window.quickSwitchDateAndRun = quickSwitchDateAndRun;
+
+function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existingKeys, state, origOffset) {
+  const matrix = sheetToMatrixWithMerges(ws);
+  const det = detectHeaderAndCols(matrix);
+  if (det.failed) return { failed: true, isHeaderless: false };
+  if (det.isHeaderless) state.anyHeaderless = true;
+
+  const meta = extractSheetMeta(matrix, det.headerRow, sheetName, fName, det.cols);
+  const baseDeptCfg = resolveDeptConfig(manualDept || meta.metaDept, meta.metaPerson);
+  if (!manualDept && baseDeptCfg.std && wbBatchCache.length <= 1) {
+    document.getElementById("deptInput").value = baseDeptCfg.std;
+  }
+
+  const c = det.cols;
+  let carryDate = meta.metaDate || "";
+  let carryPerson = meta.metaPerson || "";
+  let carryDept = "";
+
+  for (let r = det.dataStartRow; r < matrix.length; r++) {
+    const row = matrix[r] || [];
+
+    if (c.date >= 0) {
+      const rd = pDate(row[c.date]);
+      if (rd) {
+        carryDate = rd;
+        state.foundDates.add(rd);
+      }
+    }
+    if (c.person >= 0) {
+      const rp = kText(row[c.person]);
+      if (rp) carryPerson = rp;
+    }
+    if (c.dept >= 0) {
+      const rdp = kText(row[c.dept]);
+      if (rdp && !isPureNumericSpecialCode(rdp)) carryDept = rdp;
+    }
+
+    const code = c.code >= 0 ? kText(row[c.code]) : "";
+    const name = c.name >= 0 ? kText(row[c.name]) : "";
+    const qtyRaw = c.qty >= 0 ? kText(row[c.qty]) : "";
+    if (!code && !name) continue;
+    if (/^(合计|总计|小计|制表|审核|批准|备注|领料人|序号)$/.test(name) || /^(合计|总计|小计)$/.test(code)) continue;
+    if (!qtyRaw && !code) continue;
+
+    const rowDate = carryDate || meta.metaDate;
+    if (rowDate) state.foundDates.add(rowDate);
+    if (rowDate && rowDate !== targetDate) continue;
+
+    const rawDeptCell = c.dept >= 0 ? kText(row[c.dept]) : "";
+    const rowPerson = (c.person >= 0 ? kText(row[c.person]) : "") || carryPerson;
+
+    const isExcludedPerson = EXCLUDED_PERSONS.some(ep => rowPerson.includes(ep));
+    const isExcludedDept = EXCLUDED_DEPTS.some(ed => `${rawDeptCell} ${carryDept}`.toUpperCase().includes(ed.toUpperCase()));
+    if (isExcludedPerson || isExcludedDept) {
+      state.excludedSkipped++;
+      continue;
+    }
+
+    const effectiveDeptRaw = (!isPureNumericSpecialCode(rawDeptCell) ? rawDeptCell : "") || carryDept || manualDept || meta.metaDept;
+    const rowDeptCfg = resolveDeptConfig(effectiveDeptRaw, rowPerson);
+
+    if (rowPerson && !rowDeptCfg._personMatched) {
+      const pureName = rowPerson.replace(/\s*(自取|补单)\s*$/g, "").trim();
+      if (pureName && !state.unknownPersons.has(pureName)) {
+        state.unknownPersons.set(pureName, rowDeptCfg.std || "");
+      }
+    }
+
+    const remarkParts = [];
+    const seenParts = new Set();
+    let extractedUsageCode = "";
+
+    const pushRemarkVal = v => {
+      const s = kText(v);
+      if (!s) return;
+      if (rowDeptCfg.type === "maint" && isPureNumericSpecialCode(s)) {
+        if (!extractedUsageCode) extractedUsageCode = s;
+        return;
+      }
+      if (!seenParts.has(s)) {
+        seenParts.add(s);
+        remarkParts.push(s);
+      }
+    };
+
+    const rCols = (c.remarkCols && c.remarkCols.length > 0) ? c.remarkCols : (c.remark >= 0 ? [c.remark] : []);
+    for (const rc of rCols) {
+      pushRemarkVal(row[rc]);
+    }
+    if (remarkParts.length === 0 && c.fallbackTextCols && c.fallbackTextCols.length > 0) {
+      for (const fc of c.fallbackTextCols) {
+        const fv = kText(row[fc]);
+        if (!fv) continue;
+        if (/^\d+(\.\d+)?$/.test(fv) && !isPureNumericSpecialCode(fv)) continue;
+        if (pDate(fv)) continue;
+        if (fv.length <= 1 && !/[\u4e00-\u9fa5]/.test(fv)) continue;
+        pushRemarkVal(fv);
+      }
+    }
+    if (remarkParts.length === 0 && rowDeptCfg._personMatched && rawDeptCell && !isPureNumericSpecialCode(rawDeptCell)) {
+      if (rawDeptCell !== rowDeptCfg.std && !rowDeptCfg.keys?.some(k => k.toUpperCase() === rawDeptCell.toUpperCase())) {
+        pushRemarkVal(rawDeptCell);
+      }
+    }
+
+    const item = classifyRow({
+      code,
+      name,
+      spec: c.spec >= 0 ? kText(row[c.spec]) : "",
+      qty: qtyRaw,
+      unit: c.unit >= 0 ? kText(row[c.unit]) : "",
+      warehouse: c.warehouse >= 0 ? kText(row[c.warehouse]) : "",
+      person: rowPerson,
+      remark: remarkParts.join(" "),
+      usageCode: extractedUsageCode || (c.usageCode >= 0 ? kText(row[c.usageCode]) : ""),
+      rawDept: rawDeptCell,
+      project: c.project >= 0 ? kText(row[c.project]) : "",
+      pickup: c.pickup >= 0 ? kText(row[c.pickup]) : "",
+      special: c.special >= 0 ? kText(row[c.special]) : ""
+    }, rowDeptCfg, targetDate, origOffset + r);
+
+    const fp = `${item.date}|${item.dept}|${item.code}|${item.qty}|${item.name}`;
+    if (dedupEnabled && existingKeys.has(fp)) {
+      state.dupSkipped++;
+      continue;
+    }
+    existingKeys.add(fp);
+    state.candidates.push(item);
+  }
+  return { failed: false };
+}
+
+function runAudit() {
+  if (!wbCache && (!wbBatchCache || !wbBatchCache.length)) {
+    return setStatusBox("error", "❌ 请先选择一个或多个车间领料申报单 (.xlsx / .xls) 文件。");
+  }
+  const sheetName = document.getElementById("sheetSelect").value;
+  const targetDate = document.getElementById("dateInput").value;
+  if (!sheetName) return setStatusBox("error", "❌ 请先选择目标工作表 (Sheet)。");
+  if (!targetDate) return setStatusBox("error", "❌ 请先填写目标业务日期。");
+
+  const existingKeys = new Set(
+    masterRecords.filter(r => !r._isBlank).map(r => `${r.date}|${r.dept}|${r.code}|${r.qty}|${r.name}`)
+  );
+
+  const state = {
+    foundDates: new Set(),
+    candidates: [],
+    unknownPersons: new Map(),
+    dupSkipped: 0,
+    excludedSkipped: 0,
+    anyHeaderless: false,
+    filesProcessed: 0
+  };
+
+  const isBatchMode = wbBatchCache.length > 1 && sheetName === "__BATCH_AUTO__";
+  const manualDept = isBatchMode ? "" : kText(document.getElementById("deptInput").value);
+
+  if (isBatchMode) {
+    wbBatchCache.forEach((entry, idx) => {
+      const ws = entry.wb.Sheets[entry.bestSheet];
+      if (!ws) return;
+      const res = auditSingleSheet(ws, entry.bestSheet, entry.fileName, targetDate, "", existingKeys, state, idx * 10000);
+      if (!res.failed) state.filesProcessed++;
+    });
+  } else {
+    const ws = wbCache.Sheets[sheetName];
+    const res = auditSingleSheet(ws, sheetName, fileNameCache, targetDate, manualDept, existingKeys, state, 0);
+    if (res.failed) {
+      return setStatusBox("error", "❌ 未在当前工作表中识别到标准表头或物料编码列，请切换正确的工作表 (Sheet)。");
+    }
+    state.filesProcessed = 1;
+  }
+
+  const { candidates, foundDates, unknownPersons, dupSkipped, excludedSkipped } = state;
+
+  if (candidates.length === 0) {
+    if (dupSkipped > 0) {
+      return setStatusBox("warn", `⚠️ 检测到 <b>${dupSkipped}</b> 条 ${targetDate} 的记录已存在于历史出库底表中，已自动防重拦截。如需强制重新核算，请先点击“自动防重”切换为关闭状态。`);
+    }
+    const dateBtns = Array.from(foundDates).sort().reverse().slice(0, 6).map(d =>
+      `<button onclick="quickSwitchDateAndRun('${d}')" class="ml-1.5 mt-1 px-2 py-0.5 bg-amber-600 hover:bg-amber-700 text-white rounded font-semibold">切换为 ${d}</button>`
+    ).join("");
+    return setStatusBox("warn", `⚠️ 在 <b>${targetDate}</b> 下未筛选出有效领料行。${excludedSkipped > 0 ? `（已过滤非 HJF/王雷 记录 ${excludedSkipped} 条）` : ""}${foundDates.size > 0 ? `<br/>表内检测到的日期：${dateBtns}` : ""}`);
+  }
+
+  workRows = sortAndInsertBlankRows(candidates);
+
+  const newRealRows = candidates.map(it => ({ ...it }));
+  masterRecords = mergeRecordsById(masterRecords, newRealRows);
+
+  persistAllState(true);
+  refreshMasterDateOptions();
+  renderWorkTable();
+  renderMasterTable();
+
+  const pgHitCount = candidates.filter(x => x._pgHit).length;
+  const modeNote = `${isBatchMode ? `（已批量连算 ${state.filesProcessed} 个车间文件）` : ""}${state.anyHeaderless ? "（含无表头智能识别）" : ""}`;
+  let alertHtml = "";
+  if (unknownPersons.size > 0) {
+    const btns = Array.from(unknownPersons.entries()).slice(0, 6).map(([pname, dname]) =>
+      `<button onclick="openDeptModal('${escapeHtml(pname).replace(/'/g, "\\'")}', '${escapeHtml(dname).replace(/'/g, "\\'")}' )" class="ml-1.5 mt-1 px-2 py-0.5 bg-amber-600 hover:bg-amber-700 text-white rounded font-semibold">⚙️ 绑定「${escapeHtml(pname)}」</button>`
+    ).join("");
+    alertHtml = `<div class="mt-2 pt-2 border-t border-emerald-200 text-amber-900">⚠️ <b>人员变动提醒</b>：检测到 ${unknownPersons.size} 位未在领料人对照表登记的人员（系统已暂按表头/部门列归类），点击可快速绑定车间与英文前缀：${btns}</div>`;
+  }
+  setStatusBox("ok", `✅ 核算完成${modeNote}！本次放行 <b>${candidates.length}</b> 条有效领料行（含自动插入组间空行，共渲染 ${workRows.length} 行）并已实时归档至历史底表总账。${dupSkipped > 0 ? ` 已自动拦截重复 ${dupSkipped} 条。` : ""}${excludedSkipped > 0 ? ` 已过滤非 HJF/王雷 ${excludedSkipped} 条。` : ""}${pgHitCount > 0 ? ` 命中 P3/GD1 库存 ${pgHitCount} 条。` : ""}${alertHtml}`);
+}
+
+// =========================================================================
+// 10.5 车间与领料人维护弹窗逻辑
+// =========================================================================
+function openDeptModal(prefillPerson = "", prefillDept = "") {
+  const modal = document.getElementById("deptManagerModal");
+  const sel = document.getElementById("modalDeptSelect");
+  if (!modal || !sel) return;
+
+  sel.innerHTML = DEPT_MAPS.map(d => `<option value="${escapeHtml(d.std)}">${escapeHtml(d.std)}${d.prefix ? ` (${escapeHtml(d.prefix)})` : " (无前缀)"}</option>`).join("") +
+    `<option value="__CUSTOM__">+ 自定义新车间...</option>`;
+
+  if (prefillDept && DEPT_MAPS.some(d => d.std === prefillDept)) {
+    sel.value = prefillDept;
+  }
+  document.getElementById("modalPersonInput").value = prefillPerson || "";
+  onModalDeptSelectChange();
+  renderCustomMapTable();
+  modal.classList.remove("hidden");
+}
+window.openDeptModal = openDeptModal;
+
+function closeDeptModal() {
+  document.getElementById("deptManagerModal")?.classList.add("hidden");
+}
+window.closeDeptModal = closeDeptModal;
+
+function onModalDeptSelectChange() {
+  const selVal = document.getElementById("modalDeptSelect")?.value;
+  const customWrap = document.getElementById("modalCustomDeptWrap");
+  const prefixEl = document.getElementById("modalPrefixInput");
+  if (selVal === "__CUSTOM__") {
+    customWrap?.classList.remove("hidden");
+    if (prefixEl) prefixEl.value = "";
+  } else {
+    customWrap?.classList.add("hidden");
+    const found = DEPT_MAPS.find(d => d.std === selVal);
+    if (prefixEl) prefixEl.value = found ? (found.prefix || "") : "";
+  }
+}
+window.onModalDeptSelectChange = onModalDeptSelectChange;
+
+function renderCustomMapTable() {
+  const tbody = document.getElementById("customMapTbody");
+  const cnt = document.getElementById("customMapCount");
+  if (cnt) cnt.textContent = `${customPersonMaps.length} 条`;
+  if (!tbody) return;
+  if (!customPersonMaps.length) {
+    tbody.innerHTML = `<tr><td colspan="4" class="text-center py-4 text-slate-400">暂无自定义变动记录</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = customPersonMaps.map((m, idx) => `
+    <tr class="border-b border-slate-100 hover:bg-slate-50">
+      <td class="px-2.5 py-1.5 font-semibold text-slate-800">${escapeHtml(m.person)}</td>
+      <td class="px-2.5 py-1.5 text-blue-700">${escapeHtml(m.std)}</td>
+      <td class="px-2.5 py-1.5 text-slate-600 font-mono">${escapeHtml(m.prefix || "(无)")}</td>
+      <td class="px-2.5 py-1.5 text-center">
+        <button onclick="deleteCustomPersonMapping(${idx})" class="px-2 py-0.5 bg-rose-100 hover:bg-rose-200 text-rose-700 rounded font-semibold">删除</button>
+      </td>
+    </tr>
+  `).join("");
+}
+
+function saveCustomPersonMapping(andRerun = false) {
+  const person = kText(document.getElementById("modalPersonInput")?.value);
+  const selVal = document.getElementById("modalDeptSelect")?.value;
+  const std = selVal === "__CUSTOM__" ? kText(document.getElementById("modalCustomDeptInput")?.value) : selVal;
+  const prefix = kText(document.getElementById("modalPrefixInput")?.value);
+  if (!person) return showToast("请输入领料人姓名");
+  if (!std) return showToast("请选择或输入归属车间");
+
+  const existIdx = customPersonMaps.findIndex(m => m.person.toUpperCase() === person.toUpperCase());
+  const entry = { person, std, prefix };
+  if (existIdx >= 0) customPersonMaps[existIdx] = entry;
+  else customPersonMaps.unshift(entry);
+
+  persistAllState(true);
+  renderCustomMapTable();
+  showToast(`已保存：${person} → ${std}${prefix ? ` (${prefix})` : ""}`);
+
+  if (andRerun) {
+    closeDeptModal();
+    if (wbCache) {
+      const prevDedup = dedupEnabled;
+      dedupEnabled = false;
+      runAudit();
+      dedupEnabled = prevDedup;
+    }
+  }
+}
+window.saveCustomPersonMapping = saveCustomPersonMapping;
+
+function deleteCustomPersonMapping(idx) {
+  customPersonMaps.splice(idx, 1);
+  persistAllState(true);
+  renderCustomMapTable();
+  showToast("已删除该条自定义映射");
+}
+window.deleteCustomPersonMapping = deleteCustomPersonMapping;
+
+function toggleDedupMode() {
+  dedupEnabled = !dedupEnabled;
+  const btn = document.getElementById("dedupToggleBtn");
+  if (dedupEnabled) {
+    btn.className = "h-11 bg-teal-600 hover:bg-teal-700 active:scale-[0.99] text-white font-bold rounded-xl shadow-sm flex items-center justify-center gap-1.5 text-xs sm:text-sm";
+    btn.innerHTML = "<span>🛡️ 自动防重：已开启</span>";
+    showToast("已开启自动防重：重复核算同日同物资将被拦截");
+  } else {
+    btn.className = "h-11 bg-amber-600 hover:bg-amber-700 active:scale-[0.99] text-white font-bold rounded-xl shadow-sm flex items-center justify-center gap-1.5 text-xs sm:text-sm";
+    btn.innerHTML = "<span>⚠️ 自动防重：已关闭</span>";
+    showToast("已关闭自动防重：允许重复核算覆盖/测试");
+  }
+}
+
+// =========================================================================
+// 11. 双页签切换、表格渲染与类 Excel 多格框选
+// =========================================================================
+function switchPage(page) {
+  activeGrid = page;
+  const pWork = document.getElementById("pageWork");
+  const pMaster = document.getElementById("pageMaster");
+  const bWork = document.getElementById("tabBtnWork");
+  const bMaster = document.getElementById("tabBtnMaster");
+  if (page === "work") {
+    pWork.classList.remove("hidden");
+    pMaster.classList.add("hidden");
+    bWork.className = "px-4 py-2.5 text-xs sm:text-sm font-bold rounded-t-lg border-t border-l border-r border-slate-200 bg-white text-blue-700 -mb-px whitespace-nowrap";
+    bMaster.className = "px-4 py-2.5 text-xs sm:text-sm font-semibold rounded-t-lg text-slate-600 hover:text-slate-900 flex items-center gap-1.5 whitespace-nowrap";
+  } else {
+    pWork.classList.add("hidden");
+    pMaster.classList.remove("hidden");
+    bMaster.className = "px-4 py-2.5 text-xs sm:text-sm font-bold rounded-t-lg border-t border-l border-r border-slate-200 bg-white text-blue-700 -mb-px flex items-center gap-1.5 whitespace-nowrap";
+    bWork.className = "px-4 py-2.5 text-xs sm:text-sm font-semibold rounded-t-lg text-slate-600 hover:text-slate-900 whitespace-nowrap";
+    refreshMasterDateOptions();
+    renderMasterTable();
+  }
+}
+
+const selState = {
+  work: { active: false, dragging: false, r0: -1, c0: -1, r1: -1, c1: -1 },
+  master: { active: false, dragging: false, r0: -1, c0: -1, r1: -1, c1: -1 }
+};
+
+function getGridKeys(grid) {
+  return grid === "work" ? COLS_14 : ["date", ...COLS_14];
+}
+
+function getGridRows(grid) {
+  return grid === "work" ? workRows : masterViewRows;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function renderWorkTable() {
+  const tbody = document.getElementById("workTbody");
+  if (!tbody) return;
+  if (!workRows || workRows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="15" class="text-center py-8 text-slate-400">请先上传车间领料申报单并点击“一键核算”</td></tr>`;
+    return;
+  }
+  const html = workRows.map((row, rIdx) => {
+    const cls = row._isBlank ? "blank-sep-row" : "hover:bg-blue-50/40";
+    const tds = COLS_14.map((k, cIdx) => {
+      const extra = (k === "code" && row._pgHit) ? " pg-hit-badge" : "";
+      return `<td data-grid="work" data-r="${rIdx}" data-c="${cIdx}" class="px-2.5 py-1.5${extra}">${escapeHtml(row[k])}</td>`;
+    }).join("");
+    return `<tr class="${cls}"><td data-rowidx="${rIdx}" class="row-idx-cell px-2 py-1.5 text-center text-slate-400 select-none">${rIdx + 1}</td>${tds}</tr>`;
+  }).join("");
+  tbody.innerHTML = html;
+  applySelectionStyles("work");
+}
+
+function refreshMasterDateOptions() {
+  const sel = document.getElementById("masterDateFilter");
+  if (!sel) return;
+  const prev = sel.value || "ALL";
+  const counts = {};
+  masterRecords.filter(r => !r._isBlank).forEach(r => {
+    const d = r.date || "未标注日期";
+    counts[d] = (counts[d] || 0) + 1;
+  });
+  const dates = Object.keys(counts).sort().reverse();
+  const total = masterRecords.filter(r => !r._isBlank).length;
+  sel.innerHTML = `<option value="ALL">全部日期底表 (${total} 条)</option>` +
+    dates.map(d => `<option value="${d}">${d} (${counts[d]} 条)</option>`).join("");
+  if (prev === "ALL" || counts[prev]) sel.value = prev;
+  updateLedgerBadge();
+}
+
+function renderMasterTable() {
+  const tbody = document.getElementById("masterTbody");
+  if (!tbody) return;
+  const dateFilter = document.getElementById("masterDateFilter")?.value || "ALL";
+  const kw = kText(document.getElementById("masterSearchInput")?.value).toLowerCase();
+
+  let filtered = masterRecords.filter(r => !r._isBlank);
+  if (dateFilter !== "ALL") filtered = filtered.filter(r => (r.date || "未标注日期") === dateFilter);
+  if (kw) {
+    filtered = filtered.filter(r =>
+      `${r.date} ${r.dept} ${r.person} ${r.warehouse} ${r.code} ${r.name} ${r.usage} ${r.remark}`.toLowerCase().includes(kw)
+    );
+  }
+
+  masterViewRows = sortAndInsertBlankRows(filtered);
+
+  if (masterViewRows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="16" class="text-center py-8 text-slate-400">暂无符合条件的历史出库底表记录</td></tr>`;
+    return;
+  }
+
+  const keys = getGridKeys("master");
+  const html = masterViewRows.map((row, rIdx) => {
+    const cls = row._isBlank ? "blank-sep-row" : "hover:bg-blue-50/40";
+    const tds = keys.map((k, cIdx) => {
+      const extra = k === "date" ? " text-blue-700 font-medium" : ((k === "code" && row._pgHit) ? " pg-hit-badge" : "");
+      return `<td data-grid="master" data-r="${rIdx}" data-c="${cIdx}" class="px-2.5 py-1.5${extra}">${escapeHtml(row[k])}</td>`;
+    }).join("");
+    return `<tr class="${cls}"><td data-rowidx="${rIdx}" class="row-idx-cell px-2 py-1.5 text-center text-slate-400 select-none">${rIdx + 1}</td>${tds}</tr>`;
+  }).join("");
+  tbody.innerHTML = html;
+  applySelectionStyles("master");
+}
+
+function getSelBounds(grid) {
+  const st = selState[grid];
+  if (!st.active || st.r0 < 0) return null;
+  return {
+    rMin: Math.min(st.r0, st.r1),
+    rMax: Math.max(st.r0, st.r1),
+    cMin: Math.min(st.c0, st.c1),
+    cMax: Math.max(st.c0, st.c1)
+  };
+}
+
+function applySelectionStyles(grid) {
+  const tbody = document.getElementById(grid === "work" ? "workTbody" : "masterTbody");
+  const bar = document.getElementById(grid === "work" ? "workBulkBar" : "masterBulkBar");
+  const info = document.getElementById(grid === "work" ? "workSelInfo" : "masterSelInfo");
+  if (!tbody) return;
+
+  tbody.querySelectorAll("td.excel-cell-selected, td.excel-cell-active, td.sel-top, td.sel-bottom, td.sel-left, td.sel-right").forEach(td => {
+    td.classList.remove("excel-cell-selected", "excel-cell-active", "sel-top", "sel-bottom", "sel-left", "sel-right");
+  });
+  tbody.querySelectorAll(".excel-fill-handle").forEach(el => el.remove());
+
+  const b = getSelBounds(grid);
+  if (!b) {
+    if (bar) bar.classList.add("hidden");
+    return;
+  }
+  const st = selState[grid];
+  let count = 0;
+
+  // 直接按行/列索引定位，避免全表 querySelectorAll 造成的拖动卡顿
+  for (let r = b.rMin; r <= b.rMax; r++) {
+    const tr = tbody.children[r];
+    if (!tr) continue;
+    for (let c = b.cMin; c <= b.cMax; c++) {
+      const td = tr.children[c + 1];
+      if (!td) continue;
+      td.classList.add("excel-cell-selected");
+      if (r === b.rMin) td.classList.add("sel-top");
+      if (r === b.rMax) td.classList.add("sel-bottom");
+      if (c === b.cMin) td.classList.add("sel-left");
+      if (c === b.cMax) td.classList.add("sel-right");
+      if (r === st.r0 && c === st.c0) td.classList.add("excel-cell-active");
+      if (r === b.rMax && c === b.cMax) {
+        const handle = document.createElement("div");
+        handle.className = "excel-fill-handle";
+        handle.title = "拖动填充选中内容";
+        td.appendChild(handle);
+      }
+      count++;
+    }
+  }
+  if (bar && info) {
+    bar.classList.remove("hidden");
+    info.textContent = `已选中 ${b.rMax - b.rMin + 1} 行 × ${b.cMax - b.cMin + 1} 列（共 ${count} 格）`;
+  }
+}
+
+function clearSelection(grid) {
+  selState[grid] = { active: false, dragging: false, r0: -1, c0: -1, r1: -1, c1: -1 };
+  applySelectionStyles(grid);
+}
+
+function selectAllGrid(grid) {
+  const rows = getGridRows(grid);
+  const keys = getGridKeys(grid);
+  if (!rows.length) return showToast("当前表格暂无数据");
+  selState[grid] = { active: true, dragging: false, r0: 0, c0: 0, r1: rows.length - 1, c1: keys.length - 1 };
+  applySelectionStyles(grid);
+}
+
+function syncMasterRowEdit(rowObj) {
+  if (!rowObj || rowObj._isBlank) return;
+  const idx = masterRecords.findIndex(m => m._id === rowObj._id);
+  if (idx >= 0) masterRecords[idx] = { ...rowObj };
+}
+
+function applyBulkFill(grid) {
+  const b = getSelBounds(grid);
+  if (!b) return showToast("请先点击或框选单元格");
+  const inputEl = document.getElementById(grid === "work" ? "workBulkInput" : "masterBulkInput");
+  const newVal = inputEl ? inputEl.value : "";
+  const rows = getGridRows(grid);
+  const keys = getGridKeys(grid);
+  const tbody = document.getElementById(grid === "work" ? "workTbody" : "masterTbody");
+
+  for (let r = b.rMin; r <= b.rMax; r++) {
+    const row = rows[r];
+    if (!row) continue;
+    for (let c = b.cMin; c <= b.cMax; c++) {
+      row[keys[c]] = newVal;
+      const td = tbody?.children[r]?.children[c + 1];
+      if (td) td.textContent = newVal;
+    }
+    if (grid === "master") syncMasterRowEdit(row);
+    else if (!row._isBlank) syncMasterRowEdit(row);
+  }
+
+  persistAllState(true);
+  applySelectionStyles(grid);
+  showToast(`已批量修改 ${b.rMax - b.rMin + 1} 行 × ${b.cMax - b.cMin + 1} 列`);
+}
+
+function addBlankWorkRow() {
+  const targetDate = document.getElementById("dateInput").value || new Date().toISOString().slice(0, 10);
+  const dept = kText(document.getElementById("deptInput").value);
+  const newRow = {
+    _id: `manual_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    date: targetDate, dept, person: "", warehouse: "", code: "", name: "", qty: "", unit: "",
+    project: "HF999999999NT9999", line: "镍铁冶炼共用", usage: "其他综合物资", subject: "510107",
+    remark: "", pickup: "", special: ""
+  };
+  workRows.push(newRow);
+  masterRecords.push({ ...newRow });
+  persistAllState(true);
+  renderWorkTable();
+  refreshMasterDateOptions();
+  showToast("已在工作台末尾新增一行（双击单元格可直接填写）");
+}
+
+function deleteSelectedWorkRows() {
+  const b = getSelBounds("work");
+  if (!b) return showToast("请先点击或框选要删除的行");
+  const removed = workRows.splice(b.rMin, b.rMax - b.rMin + 1);
+  const removedIds = new Set(removed.filter(r => r && r._id).map(r => r._id));
+  if (removedIds.size > 0) {
+    masterRecords = masterRecords.filter(m => !removedIds.has(m._id));
+  }
+  clearSelection("work");
+  persistAllState(true);
+  renderWorkTable();
+  refreshMasterDateOptions();
+  showToast(`已删除选中的 ${removed.length} 行`);
+}
+
+function addBlankMasterRow() {
+  const df = document.getElementById("masterDateFilter")?.value;
+  const dateStr = (df && df !== "ALL") ? df : (document.getElementById("dateInput").value || new Date().toISOString().slice(0, 10));
+  const newRow = {
+    _id: `master_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    date: dateStr, dept: "", person: "", warehouse: "", code: "", name: "", qty: "", unit: "",
+    project: "HF999999999NT9999", line: "镍铁冶炼共用", usage: "其他综合物资", subject: "510107",
+    remark: "", pickup: "", special: ""
+  };
+  masterRecords.push(newRow);
+  persistAllState(true);
+  refreshMasterDateOptions();
+  renderMasterTable();
+  showToast("已在底表新增一行");
+}
+
+function deleteSelectedMasterRows() {
+  const b = getSelBounds("master");
+  if (!b) return showToast("请先点击或框选要删除的底表行");
+  const ids = new Set();
+  for (let r = b.rMin; r <= b.rMax; r++) {
+    const row = masterViewRows[r];
+    if (row && !row._isBlank && row._id) ids.add(row._id);
+  }
+  if (ids.size === 0) return showToast("选中的仅为空行，未删除数据记录");
+  masterRecords = masterRecords.filter(m => !ids.has(m._id));
+  clearSelection("master");
+  persistAllState(true);
+  refreshMasterDateOptions();
+  renderMasterTable();
+  showToast(`已从历史底表删除 ${ids.size} 条记录`);
+}
+
+function clearMasterBySelectedDate() {
+  const df = document.getElementById("masterDateFilter")?.value || "ALL";
+  if (df === "ALL") return showToast("请先在左侧下拉框选择一个具体日期，再清除该日数据");
+  const before = masterRecords.length;
+  masterRecords = masterRecords.filter(r => (r.date || "未标注日期") !== df);
+  const removed = before - masterRecords.length;
+  clearSelection("master");
+  persistAllState(true);
+  refreshMasterDateOptions();
+  renderMasterTable();
+  showToast(`已清除 ${df} 的 ${removed} 条后台记录`);
+}
+
+function pruneMasterKeepRecent7Days() {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 7);
+  const cutoffStr = formatDateIso(cutoff.getFullYear(), cutoff.getMonth() + 1, cutoff.getDate());
+  const before = masterRecords.length;
+  masterRecords = masterRecords.filter(r => !r.date || r.date >= cutoffStr);
+  const removed = before - masterRecords.length;
+  clearSelection("master");
+  persistAllState(true);
+  refreshMasterDateOptions();
+  renderMasterTable();
+  showToast(`已清理 ${cutoffStr} 之前的 ${removed} 条过期记录`);
+}
+
+function clearAllMasterConfirm() {
+  const btn = document.getElementById("clearAllMasterBtn");
+  if (!clearAllArmed) {
+    clearAllArmed = true;
+    btn.textContent = "❗ 再次点击确认清空全部";
+    btn.classList.add("bg-rose-600", "text-white");
+    clearTimeout(clearAllArmTimer);
+    clearAllArmTimer = setTimeout(() => {
+      clearAllArmed = false;
+      btn.textContent = "⚠️ 清空全部后台数据";
+      btn.classList.remove("bg-rose-600", "text-white");
+    }, 4000);
+    return;
+  }
+  clearTimeout(clearAllArmTimer);
+  clearAllArmed = false;
+  btn.textContent = "⚠️ 清空全部后台数据";
+  btn.classList.remove("bg-rose-600", "text-white");
+  masterRecords = [];
+  workRows = [];
+  clearSelection("master");
+  clearSelection("work");
+  persistAllState(true);
+  refreshMasterDateOptions();
+  renderWorkTable();
+  renderMasterTable();
+  showToast("已清空全部后台出库底表数据");
+}
+
+// =========================================================================
+// 12. 复制、键盘快捷键与 Excel 双工作表总账导出/回导
+// =========================================================================
+function copySelectedRange(grid) {
+  const b = getSelBounds(grid);
+  if (!b) return showToast("请先点击或框选要复制的单元格");
+  const rows = getGridRows(grid);
+  const keys = getGridKeys(grid);
+  const lines = [];
+  for (let r = b.rMin; r <= b.rMax; r++) {
+    const row = rows[r];
+    if (!row) continue;
+    const cols = [];
+    for (let c = b.cMin; c <= b.cMax; c++) {
+      cols.push(row[keys[c]] ?? "");
+    }
+    lines.push(cols.join("\t"));
+  }
+  copyTextToClipboard(lines.join("\n"));
+  showToast(`已复制选中的 ${b.rMax - b.rMin + 1} 行 × ${b.cMax - b.cMin + 1} 列区域`);
+}
+
+function copyWorkTable() {
+  if (!workRows.length) return showToast("当前工作台暂无数据可复制");
+  const lines = workRows.map(r => COLS_14.map(k => r[k] ?? "").join("\t"));
+  copyTextToClipboard(lines.join("\n"));
+  showToast(`已复制工作台全部 ${workRows.length} 行（14列格式，可直接粘贴至 Excel）`);
+}
+
+function copyMasterTable() {
+  if (!masterViewRows.length) return showToast("当前底表暂无数据可复制");
+  const lines = masterViewRows.map(r => COLS_14.map(k => r[k] ?? "").join("\t"));
+  copyTextToClipboard(lines.join("\n"));
+  showToast(`已复制当前底表 ${masterViewRows.length} 行（14列格式，可直接粘贴至 Excel）`);
+}
+
+document.addEventListener("keydown", e => {
+  const tag = (document.activeElement?.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") return;
+
+  const grid = activeGrid;
+  const st = selState[grid];
+  const rows = getGridRows(grid);
+  const keys = getGridKeys(grid);
+
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
+    if (window.getSelection()?.toString()) return;
+    if (getSelBounds(grid)) {
+      e.preventDefault();
+      copySelectedRange(grid);
+    } else if (grid === "work" && workRows.length > 0) {
+      e.preventDefault();
+      copyWorkTable();
+    } else if (grid === "master" && masterViewRows.length > 0) {
+      e.preventDefault();
+      copyMasterTable();
+    }
+    return;
+  }
+
+  if (!st.active || st.r0 < 0 || !rows.length) return;
+
+  if (e.key === "Escape") {
+    clearSelection(grid);
+    return;
+  }
+
+  if (e.key === "Delete" || e.key === "Backspace") {
+    e.preventDefault();
+    const b = getSelBounds(grid);
+    if (!b) return;
+    for (let r = b.rMin; r <= b.rMax; r++) {
+      const row = rows[r];
+      if (!row) continue;
+      for (let c = b.cMin; c <= b.cMax; c++) {
+        row[keys[c]] = "";
+      }
+      if (!row._isBlank) syncMasterRowEdit(row);
+    }
+    persistAllState(true);
+    if (grid === "work") renderWorkTable();
+    else renderMasterTable();
+    showToast("已清空选中单元格内容");
+    return;
+  }
+
+  if (e.key === "F2" || e.key === "Enter") {
+    e.preventDefault();
+    startInlineEdit(grid, st.r0, st.c0);
+    return;
+  }
+
+  // 直接键入可见字符时自动进入编辑（类 Excel / Handsontable 体验）
+  if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
+    e.preventDefault();
+    startInlineEdit(grid, st.r0, st.c0, e.key);
+    return;
+  }
+
+  const moveMap = {
+    ArrowUp: [-1, 0],
+    ArrowDown: [1, 0],
+    ArrowLeft: [0, -1],
+    ArrowRight: [0, 1],
+    Tab: [0, e.shiftKey ? -1 : 1]
+  };
+  if (moveMap[e.key]) {
+    e.preventDefault();
+    const [dr, dc] = moveMap[e.key];
+    const nr = Math.max(0, Math.min(rows.length - 1, st.r0 + dr));
+    const nc = Math.max(0, Math.min(keys.length - 1, st.c0 + dc));
+    selState[grid] = { active: true, dragging: false, r0: nr, c0: nc, r1: nr, c1: nc };
+    applySelectionStyles(grid);
+    const tbody = document.getElementById(grid === "work" ? "workTbody" : "masterTbody");
+    const td = tbody?.children[nr]?.children[nc + 1];
+    if (td) td.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+});
+
+// 支持 Ctrl+V 直接从剪贴板粘贴（兼容 Excel 多行多列 TSV 粘贴）
+document.addEventListener("paste", e => {
+  const tag = (document.activeElement?.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") return;
+  const grid = activeGrid;
+  const b = getSelBounds(grid);
+  if (!b) return;
+  const text = e.clipboardData?.getData("text/plain");
+  if (!text) return;
+
+  e.preventDefault();
+  const rows = getGridRows(grid);
+  const keys = getGridKeys(grid);
+  const tbody = document.getElementById(grid === "work" ? "workTbody" : "masterTbody");
+  const pasteLines = text.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n");
+  let changed = 0;
+
+  for (let i = 0; i < pasteLines.length; i++) {
+    const r = b.rMin + i;
+    if (r >= rows.length) break;
+    const cols = pasteLines[i].split("\t");
+    for (let j = 0; j < cols.length; j++) {
+      const c = b.cMin + j;
+      if (c >= keys.length) break;
+      rows[r][keys[c]] = cols[j];
+      const td = tbody?.children[r]?.children[c + 1];
+      if (td) td.textContent = cols[j];
+      changed++;
+    }
+    if (!rows[r]._isBlank) syncMasterRowEdit(rows[r]);
+  }
+  if (changed > 0) {
+    persistAllState(true);
+    applySelectionStyles(grid);
+    showToast(`已粘贴更新 ${changed} 个单元格`);
+  }
+});
+
+function lockTextCols(ws, colIndexes) {
+  if (!ws || !ws["!ref"]) return;
+  const range = XLSX.utils.decode_range(ws["!ref"]);
+  for (let r = 1; r <= range.e.r; r++) {
+    for (const c of colIndexes) {
+      const addr = XLSX.utils.encode_cell({ r, c });
+      const cell = ws[addr];
+      if (cell && cell.v !== undefined && cell.v !== null && String(cell.v) !== "") {
+        cell.t = "s";
+        cell.v = String(cell.v);
+        cell.z = "@";
+      }
+    }
+  }
+}
+
+function exportWorkXlsx() {
+  if (!workRows.length) return showToast("当前工作台暂无数据可导出");
+  const wb = XLSX.utils.book_new();
+  const aoa = [HEADERS_14, ...workRows.map(r => COLS_14.map(k => r[k] ?? ""))];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  lockTextCols(ws, [3]); // 第4列物料编码强制文本锁前导0
+  XLSX.utils.book_append_sheet(wb, ws, "HJF标准14列");
+  const dateTag = document.getElementById("dateInput").value || "export";
+  XLSX.writeFile(wb, `HJF物资出库核算_${dateTag}.xlsx`);
+  showToast("已导出当前 14 列标准核算结果 .xlsx（编码前导0已锁定）");
+}
+
+function exportWorkbookWithLedger() {
+  const wb = XLSX.utils.book_new();
+  const workAoa = [HEADERS_14, ...workRows.map(r => COLS_14.map(k => r[k] ?? ""))];
+  const wsWork = XLSX.utils.aoa_to_sheet(workAoa);
+  lockTextCols(wsWork, [3]);
+  XLSX.utils.book_append_sheet(wb, wsWork, "HJF标准14列");
+
+  const sortedLedger = sortAndInsertBlankRows(masterRecords);
+  const ledgerHeaders = ["业务日期", ...HEADERS_14];
+  const ledgerKeys = ["date", ...COLS_14];
+  const ledgerAoa = [ledgerHeaders, ...sortedLedger.map(r => ledgerKeys.map(k => r[k] ?? ""))];
+  const wsLedger = XLSX.utils.aoa_to_sheet(ledgerAoa);
+  lockTextCols(wsLedger, [0, 4]); // 业务日期 + 物料编码强制文本
+  XLSX.utils.book_append_sheet(wb, wsLedger, "历史出库底表总账");
+
+  const today = new Date().toISOString().slice(0, 10);
+  XLSX.writeFile(wb, `HJF物资出库总账_${today}.xlsx`);
+  showToast("已导出双工作表总账 .xlsx（含组间空行与编码前导0锁定，可直接回导续接）");
+}
+
+async function importWorkbookLedger(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  try {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: "array", cellDates: true });
+    const targetSheet = wb.SheetNames.find(n => n.includes("历史出库底表")) || wb.SheetNames[0];
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[targetSheet], { header: 1, defval: "" });
+    if (rows.length < 2) return showToast("工作簿中未找到可恢复的历史记录");
+
+    const hasDateCol = cleanHeaderKey(rows[0][0]).includes("日期");
+    const imported = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i] || [];
+      const offset = hasDateCol ? 1 : 0;
+      const code = kText(r[offset + 3]);
+      const name = kText(r[offset + 4]);
+      if (!code && !name) continue;
+      const rec = {
+        date: hasDateCol ? (pDate(r[0]) || kText(r[0])) : (document.getElementById("dateInput").value || ""),
+        dept: kText(r[offset + 0]),
+        person: kText(r[offset + 1]),
+        warehouse: kText(r[offset + 2]),
+        code,
+        name,
+        qty: kText(r[offset + 5]),
+        unit: kText(r[offset + 6]),
+        project: kText(r[offset + 7]),
+        line: kText(r[offset + 8]),
+        usage: kText(r[offset + 9]),
+        subject: kText(r[offset + 10]),
+        remark: kText(r[offset + 11]),
+        pickup: kText(r[offset + 12]),
+        special: kText(r[offset + 13]),
+        _origIdx: i
+      };
+      rec._id = `${rec.date}|${rec.dept}|${rec.person}|${rec.code}|${rec.qty}|${i}`;
+      imported.push(rec);
+    }
+
+    masterRecords = mergeRecordsById(masterRecords, imported);
+    persistAllState(true);
+    refreshMasterDateOptions();
+    renderMasterTable();
+    showToast(`已成功回导续接 ${imported.length} 条历史底表记录`);
+  } catch (err) {
+    console.error(err);
+    showToast("导入工作簿续接失败，请确认文件格式");
+  } finally {
+    e.target.value = "";
+  }
+}
+
+// =========================================================================
+// 13. 启动初始化与脚本健康自检
+// =========================================================================
+async function bootApp() {
+  const dateEl = document.getElementById("dateInput");
+  if (dateEl && !dateEl.value) {
+    const now = new Date();
+    dateEl.value = formatDateIso(now.getFullYear(), now.getMonth() + 1, now.getDate());
+  }
+
+  document.getElementById("fileInput")?.addEventListener("change", handleMainFileChange);
+  document.getElementById("sheetSelect")?.addEventListener("change", e => autoInspectSheet(e.target.value));
+  document.getElementById("p3FileInput")?.addEventListener("change", e => handlePgFileUpload(e.target.files?.[0], "P3"));
+  document.getElementById("gd1FileInput")?.addEventListener("change", e => handlePgFileUpload(e.target.files?.[0], "GD1"));
+
+  setupGridInteractions("work");
+  setupGridInteractions("master");
+
+  masterRecords = await loadKv(STORAGE_KEYS.MASTER, []);
+  workRows = await loadKv(STORAGE_KEYS.WORK, []);
+  p3Items = await loadKv(STORAGE_KEYS.P3, []);
+  gd1Items = await loadKv(STORAGE_KEYS.GD1, []);
+  customPersonMaps = await loadKv(STORAGE_KEYS.CUSTOM_MAP, []);
+  rebuildPgMap();
+  refreshMasterDateOptions();
+  renderWorkTable();
+  renderMasterTable();
+
+  const hb = document.getElementById("engineHealthBadge");
+  if (hb) {
+    hb.textContent = "✅ 脚本运行正常";
+    hb.className = "bg-emerald-500/30 border border-emerald-200/50 px-3 py-1 rounded-full font-medium";
+  }
+}
+
+window.addEventListener("DOMContentLoaded", bootApp);
+</script>
+</body>
+</html>

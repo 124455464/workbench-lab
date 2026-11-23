@@ -1,0 +1,11 @@
+# 实验工作台独立仓库忽略规则（与主库 gemini-core-hub 完全隔离）
+# 业务测试数据不进 Git，继续走独立私有实验 Gist (e0bcb71c5149d8d7b4467022047c2367) 实时同步
+lab_data/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+desktop.ini
