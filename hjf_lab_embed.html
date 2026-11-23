@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>HJF 物资申报出库一键核算前端工具 v3.2（支持多文件批量连算）</title>
+  <title>HJF 物资申报出库一键核算前端工具 v3.3（智能数量列校准 + 多文件批量连算）</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
   <style>
@@ -1305,6 +1305,26 @@ function pDate(v) {
   return "";
 }
 
+function normalizeMaterialCode(v) {
+  const s = kText(v);
+  if (!s) return "";
+  // 防止 Excel / SheetJS 吞掉 11 位 ERP 物料编码的前导 0（如 03/05/06/07/08/09 开头）
+  if (/^[1-9]\d{9}$/.test(s)) return "0" + s;
+  return s;
+}
+
+async function readWorkbookSafe(file, extraOpts = {}) {
+  const buf = await file.arrayBuffer();
+  if (/\.csv$/i.test(file.name || "")) {
+    let text = new TextDecoder("utf-8").decode(buf);
+    if (text.includes("\uFFFD")) {
+      try { text = new TextDecoder("gbk").decode(buf); } catch (_) {}
+    }
+    return XLSX.read(text, { type: "string", raw: true, ...extraOpts });
+  }
+  return XLSX.read(buf, { type: "array", ...extraOpts });
+}
+
 function sheetToMatrixWithMerges(ws) {
   if (!ws || !ws["!ref"]) return [];
   const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true });
@@ -1469,59 +1489,168 @@ async function handlePgFileUpload(file, tag) {
 }
 
 // =========================================================================
-// 7. 两级表头检测（支持标准表头 + 无表头形态反推 + 多列自适应备注抓取）
+// 7. 独立安全数量解析 + 两级表头检测（支持双行合并表头、无表头反推、动态数量列校准）
 // =========================================================================
+function parseQtyValue(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") {
+    if (!Number.isFinite(v) || v < 0) return null;
+    return v;
+  }
+  let s = String(v).trim();
+  if (!s || /^[-—–/\\无空]+$/.test(s)) return null;
+  // 排除完整日期与长编码（严禁调用 pDate，防止 0.5 / 1.5 / 2.5 被误判为月.日）
+  if (/^20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}/.test(s)) return null;
+  if (/^0\d{5,}$/.test(s) || /^\d{7,}$/.test(s)) return null;
+  const cleaned = s.replace(/,/g, "").replace(/\s+/g, "");
+  // 纯数字（含小数 1.0000 / 0.5 / 2.44）
+  if (/^\d+(\.\d+)?$/.test(cleaned)) {
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : null;
+  }
+  // 带常见计量单位后缀（如 10吨、2个、3.5米、5KG）
+  const m = cleaned.match(/^(\d+(?:\.\d+)?)(?:个|件|套|台|只|根|米|m|M|kg|KG|Kg|克|g|吨|t|T|箱|包|袋|桶|瓶|盒|卷|把|张|块|条|副|双|升|L|l|支|片|组|批|捆|盘|节|付|平方|平米|立方|m2|m3|㎡|㎥)$/);
+  if (m) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function formatQtyNum(n) {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "";
+  return String(Number(n.toFixed(6)));
+}
+
+function getMainHeaderTitle(h) {
+  return cleanHeaderKey(h).split(/[：:（(【\[]/)[0].trim();
+}
+
+function isQtyHeaderExcluded(h) {
+  const main = getMainHeaderTitle(h);
+  if (!main) return true;
+  return /(库存|现存|结存|退料|退库|单价|金额|序号|编码|代码|项目|子项|日期|时间|货位|仓位)/.test(main);
+}
+
+function isQtyHeaderCandidate(h) {
+  const main = getMainHeaderTitle(h);
+  if (!main || isQtyHeaderExcluded(main)) return false;
+  return /(数量|申领|请领|申报|领用|用量|实发|需求|Qty|QTY)/i.test(main);
+}
+
+function qtyHeaderPriority(h) {
+  const main = getMainHeaderTitle(h);
+  if (!main || isQtyHeaderExcluded(main)) return -1;
+  if (/(申报数量|申领数量|请领数量|领用数量|需求数量|车间申报数量)/.test(main)) return 100;
+  if (/(申报|申领|请领|领用|用量|需求)/.test(main)) return 85;
+  if (main === "数量" || main === "数量合计" || /^qty$/i.test(main)) return 75;
+  if (main.includes("数量") && !main.includes("实发")) return 65;
+  if (main.includes("实发")) return 30;
+  return 20;
+}
+
+function colIndexToLetter(idx) {
+  let n = idx + 1, s = "";
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s || "?";
+}
+
 function detectHeaderAndCols(matrix) {
   let headerRow = -1;
+  let headerRowSpan = 1;
   const cols = {
     date: -1, dept: -1, person: -1, warehouse: -1, code: -1,
-    name: -1, spec: -1, qty: -1, unit: -1, remark: -1,
-    remarkCols: [], fallbackTextCols: [],
+    name: -1, spec: -1, qty: -1, qtyCandidates: [], unit: -1, remark: -1,
+    remarkCols: [], fallbackTextCols: [], colHeaders: [],
     usageCode: -1, project: -1, subitem: -1, pickup: -1, special: -1
+  };
+
+  const looksLikeSubHeaderRow = (nextRow) => {
+    if (!nextRow || !nextRow.length) return false;
+    let kwHits = 0, codeHits = 0, dateHits = 0;
+    for (let c = 0; c < nextRow.length; c++) {
+      const s = kText(nextRow[c]);
+      if (!s) continue;
+      if (/^0[1-9]\d{6,12}$/.test(s) || (/^\d{8,13}$/.test(s) && !/^20\d{6}$/.test(s))) codeHits++;
+      if (pDate(nextRow[c])) dateHits++;
+      if (/(数量|申报|申领|领用|实发|库存|现存|单位|规格|型号|备注|用途|编码|名称|日期)/.test(s) && s.length <= 14) kwHits++;
+    }
+    return codeHits === 0 && dateHits === 0 && kwHits >= 2;
   };
 
   for (let r = 0; r < Math.min(matrix.length, 50); r++) {
     const row = matrix[r] || [];
+    const nextRow = matrix[r + 1] || [];
+    const hasSubHeader = looksLikeSubHeaderRow(nextRow);
+    const maxLen = Math.max(row.length, hasSubHeader ? nextRow.length : 0);
+    const combinedHeaders = [];
+    for (let c = 0; c < maxLen; c++) {
+      const h1 = cleanHeaderKey(row[c]);
+      const h2 = hasSubHeader ? cleanHeaderKey(nextRow[c]) : "";
+      if (h2 && h2 !== h1) combinedHeaders[c] = h1 ? `${h1} ${h2}` : h2;
+      else combinedHeaders[c] = h1;
+    }
+
     const temp = {
       date: -1, dept: -1, person: -1, warehouse: -1, code: -1,
-      name: -1, spec: -1, qty: -1, unit: -1, remark: -1,
-      remarkCols: [], fallbackTextCols: [],
+      name: -1, spec: -1, qty: -1, qtyCandidates: [], unit: -1, remark: -1,
+      remarkCols: [], fallbackTextCols: [], colHeaders: combinedHeaders,
       usageCode: -1, project: -1, subitem: -1, pickup: -1, special: -1
     };
     const coreUsed = new Set();
     let score = 0;
 
-    for (let c = 0; c < row.length; c++) {
-      const h = cleanHeaderKey(row[c]);
+    for (let c = 0; c < maxLen; c++) {
+      const h = combinedHeaders[c];
       if (!h) continue;
-      if (temp.code < 0 && (h.includes("物料编码") || h.includes("物资编码") || h.includes("存货编码") || h === "编码" || h === "代码" || h.includes("MaterialCode"))) {
+      const main = getMainHeaderTitle(h);
+
+      // 优先拦截以「使用位置 / 备注」开头的长表头，防止说明文字里出现“车间”误判为 dept
+      if (/^(使用位置|位置|备注|用途|说明)/.test(main)) {
+        temp.remarkCols.push(c);
+        if (temp.remark < 0) temp.remark = c;
+        if (temp.usageCode < 0 && /^(使用位置|位置编码|特殊编码|设备编码)/.test(main)) {
+          temp.usageCode = c;
+        }
+        coreUsed.add(c);
+        score += 1;
+        continue;
+      }
+
+      if (temp.code < 0 && (h.includes("物料编码") || h.includes("物资编码") || h.includes("存货编码") || main === "编码" || main === "代码" || h.includes("MaterialCode"))) {
         temp.code = c; coreUsed.add(c); score += 3;
-      } else if (temp.name < 0 && (h.includes("物资名称") || h.includes("物料名称") || h.includes("存货名称") || h === "品名" || h === "名称" || h.includes("MaterialName"))) {
+      } else if (temp.name < 0 && (h.includes("物资名称") || h.includes("物料名称") || h.includes("存货名称") || main === "品名" || main === "名称" || h.includes("MaterialName"))) {
         temp.name = c; coreUsed.add(c); score += 3;
       } else if (temp.spec < 0 && (h.includes("规格") || h.includes("型号") || h.includes("Spec"))) {
         temp.spec = c; coreUsed.add(c); score += 1;
-      } else if (temp.qty < 0 && (h.includes("数量") || h.includes("申领数") || h.includes("领用数") || h === "Qty")) {
-        temp.qty = c; coreUsed.add(c); score += 2;
-      } else if (temp.unit < 0 && (h.includes("单位") || h === "Unit")) {
+      } else if (isQtyHeaderCandidate(h)) {
+        temp.qtyCandidates.push({ col: c, header: h, prio: qtyHeaderPriority(h) });
+        coreUsed.add(c);
+        if (temp.qtyCandidates.length === 1) score += 2;
+      } else if (temp.unit < 0 && (main === "单位" || main.includes("计量单位") || h === "Unit")) {
         temp.unit = c; coreUsed.add(c); score += 1;
-      } else if (temp.warehouse < 0 && (h.includes("仓库") || h.includes("库房") || h.includes("库别") || h.includes("发料仓"))) {
+      } else if (temp.warehouse < 0 && (main.includes("仓库") || main.includes("库房") || main.includes("库别") || main.includes("发料仓"))) {
         temp.warehouse = c; coreUsed.add(c); score += 1;
-      } else if (temp.person < 0 && (h.includes("领料人") || h.includes("申请人") || h.includes("提报人") || h.includes("领用人"))) {
+      } else if (temp.person < 0 && (main.includes("领料人") || main.includes("申请人") || main.includes("提报人") || main.includes("领用人"))) {
         temp.person = c; coreUsed.add(c); score += 1;
-      } else if (temp.dept < 0 && (h.includes("车间") || h.includes("部门") || h.includes("班组") || h.includes("单位部门"))) {
+      } else if (temp.dept < 0 && (main.includes("车间") || main.includes("部门") || main.includes("班组") || main.includes("单位部门"))) {
         temp.dept = c; coreUsed.add(c); score += 1;
-      } else if (temp.date < 0 && (h.includes("日期") || h.includes("时间") || h === "Date")) {
+      } else if (temp.date < 0 && (main.includes("日期") || main.includes("时间") || main === "Date")) {
         temp.date = c; coreUsed.add(c); score += 1;
-      } else if (h.includes("项目号")) {
+      } else if (main.includes("项目号")) {
         if (temp.project < 0) temp.project = c;
         coreUsed.add(c);
-      } else if (h.includes("子项")) {
+      } else if (main.includes("子项")) {
         if (temp.subitem < 0) temp.subitem = c;
         coreUsed.add(c);
-      } else if (h.includes("自取") || h.includes("补单")) {
+      } else if (main.includes("自取") || main.includes("补单")) {
         if (temp.pickup < 0) temp.pickup = c;
         coreUsed.add(c);
-      } else if (h.includes("特殊情况") || h === "特殊") {
+      } else if (main.includes("特殊情况") || main === "特殊") {
         if (temp.special < 0) temp.special = c;
         coreUsed.add(c);
       } else if (
@@ -1540,18 +1669,24 @@ function detectHeaderAndCols(matrix) {
         coreUsed.add(c);
         score += 1;
       } else if (
-        h === "序号" || h === "No" || h === "NO" || h === "编号" ||
-        h.includes("单价") || h.includes("金额") || h.includes("现存量") || h.includes("库存") ||
-        h.includes("收支项目") || h.includes("生产线") || h.includes("状态") || h.includes("审批")
+        main === "序号" || main === "No" || main === "NO" || main === "编号" ||
+        main.includes("单价") || main.includes("金额") || main.includes("现存") || main.includes("库存") ||
+        main.includes("结存") || main.includes("退料") || main.includes("收支项目") ||
+        main.includes("生产线") || main.includes("状态") || main.includes("审批")
       ) {
         coreUsed.add(c);
       }
     }
 
+    if (temp.qtyCandidates.length > 0) {
+      temp.qtyCandidates.sort((a, b) => b.prio - a.prio || a.col - b.col);
+      temp.qty = temp.qtyCandidates[0].col;
+    }
+
     if ((temp.code >= 0 && temp.name >= 0) || (score >= 6 && (temp.code >= 0 || temp.name >= 0))) {
-      // 扫描数据区最大列宽（防止机修等表在表头之后有无表头的备注列被遗漏）
-      let maxColLen = row.length;
-      for (let rr = r + 1; rr < Math.min(matrix.length, r + 40); rr++) {
+      headerRowSpan = hasSubHeader ? 2 : 1;
+      let maxColLen = maxLen;
+      for (let rr = r + headerRowSpan; rr < Math.min(matrix.length, r + 40); rr++) {
         if ((matrix[rr] || []).length > maxColLen) maxColLen = matrix[rr].length;
       }
       for (let c = 0; c < maxColLen; c++) {
@@ -1567,37 +1702,55 @@ function detectHeaderAndCols(matrix) {
 
   if (headerRow < 0) {
     const colStats = {};
-    const maxCols = Math.min(25, Math.max(...matrix.slice(0, 80).map(r => (r || []).length), 0));
+    const maxCols = Math.min(25, Math.max(...matrix.slice(0, 120).map(r => (r || []).length), 0));
     for (let c = 0; c < maxCols; c++) {
-      colStats[c] = { codeHits: 0, dateHits: 0, numHits: 0, unitHits: 0, whHits: 0, cnTextHits: 0, avgLen: 0, nonEmpty: 0 };
+      colStats[c] = {
+        codeHits: 0, dateHits: 0, numHits: 0, unitHits: 0, whHits: 0,
+        personHits: 0, statusHits: 0, remarkKwHits: 0, cnTextHits: 0,
+        totalLen: 0, nonEmpty: 0
+      };
     }
-    const unitSet = new Set(["个", "件", "套", "台", "只", "根", "米", "m", "kg", "KG", "吨", "t", "T", "箱", "包", "袋", "桶", "瓶", "盒", "卷", "把", "张", "块", "条", "副", "双", "升", "L", "支", "片", "组", "批", "捆"]);
+    const unitSet = new Set([
+      "个", "件", "套", "台", "只", "根", "米", "m", "M", "kg", "KG", "Kg", "千克", "公斤",
+      "吨", "t", "T", "箱", "包", "袋", "桶", "瓶", "盒", "卷", "把", "张", "块", "条",
+      "副", "双", "升", "L", "支", "片", "组", "批", "捆", "本", "平方", "平米", "立方", "盘", "节", "付"
+    ]);
+    const knownPersons = new Set();
+    DEPT_MAPS.forEach(d => (d.persons || []).forEach(p => knownPersons.add(p.toUpperCase())));
+    customPersonMaps.forEach(m => { if (m.person) knownPersons.add(m.person.toUpperCase()); });
 
     let firstCodeRow = -1;
-    for (let r = 0; r < Math.min(matrix.length, 100); r++) {
+    for (let r = 0; r < Math.min(matrix.length, 150); r++) {
       const row = matrix[r] || [];
       for (let c = 0; c < maxCols; c++) {
         const s = kText(row[c]);
         if (!s) continue;
         const st = colStats[c];
         st.nonEmpty++;
-        st.avgLen += s.length;
+        st.totalLen += s.length;
         if (/^0[1-9]\d{6,12}$/.test(s) || (/^\d{8,13}$/.test(s) && !/^20\d{6}$/.test(s))) {
           st.codeHits++;
           if (firstCodeRow < 0) firstCodeRow = r;
         }
         if (pDate(row[c])) st.dateHits++;
-        if (/^\d+(\.\d+)?$/.test(s) && Number(s) > 0 && Number(s) < 100000 && !/^0\d{4,}$/.test(s)) st.numHits++;
+        const qv = parseQtyValue(row[c]);
+        if (qv !== null && qv > 0 && qv < 1000000) st.numHits++;
         if (unitSet.has(s)) st.unitHits++;
-        if (/(通用仓|综合仓|辅料仓|配件仓|GD1|P3|206|207)/.test(s)) st.whHits++;
+        if (/(通用仓|综合仓|辅料仓|配件仓|GD1|P3|206|207|不在账)/.test(s)) st.whHits++;
+        if (knownPersons.has(s.toUpperCase()) || (/^[\u4e00-\u9fa5]{2,4}$/.test(s) && !unitSet.has(s) && !/(已开单|待开单|已领|未领|通用仓|综合仓|辅料仓|配件仓|不在账|手工单|电极糊|脱模剂|吹氧管|灭火器|方管|角钢|圆钢|风镐|电镐|绿泥|黄沙|镁粉)/.test(s))) {
+          st.personHits += knownPersons.has(s.toUpperCase()) ? 3 : 1;
+        }
+        if (/^(已开单|未开单|待开单|已领|已领取|已发|作废|取消)$/.test(s)) st.statusHits++;
+        if (/(使用|维修|更换|换新|制作|生产|检修|刷漆|清理|卫生|中控|值班|班组|号炉|车间|现场|自取|自提|补单)/.test(s)) st.remarkKwHits++;
         if (/[\u4e00-\u9fa5]{2,}/.test(s) && !/(通用仓|综合仓|辅料仓|配件仓)/.test(s)) st.cnTextHits++;
       }
     }
 
-    const pickBest = (field, excludeCols) => {
+    const pickBest = (field, excludeCols, filterFn = null) => {
       let bestC = -1, bestV = 0;
       for (let c = 0; c < maxCols; c++) {
         if (excludeCols.includes(c)) continue;
+        if (filterFn && !filterFn(c, colStats[c])) continue;
         if (colStats[c][field] > bestV) {
           bestV = colStats[c][field];
           bestC = c;
@@ -1612,24 +1765,67 @@ function detectHeaderAndCols(matrix) {
     cols.unit = pickBest("unitHits", used); if (cols.unit >= 0) used.push(cols.unit);
     cols.warehouse = pickBest("whHits", used); if (cols.warehouse >= 0) used.push(cols.warehouse);
 
-    if (cols.unit > 0 && colStats[cols.unit - 1]?.numHits > 0 && !used.includes(cols.unit - 1)) {
-      cols.qty = cols.unit - 1;
+    // 领料人列识别（优先已知领料人且平均长度 <= 6 的短人名列）
+    cols.person = pickBest("personHits", used, (c, st) => {
+      const avg = st.nonEmpty ? st.totalLen / st.nonEmpty : 99;
+      return avg <= 6 && st.statusHits < st.nonEmpty * 0.5 && c !== cols.code + 1;
+    });
+    if (cols.person >= 0) used.push(cols.person);
+
+    // 数量列识别：对比 unit 左右相邻列，择优取正数命中最高者
+    let bestAdjQty = -1, bestAdjHits = 0;
+    if (cols.unit >= 0) {
+      for (const adj of [cols.unit + 1, cols.unit - 1]) {
+        if (adj >= 0 && adj < maxCols && !used.includes(adj)) {
+          if (colStats[adj].numHits > bestAdjHits) {
+            bestAdjHits = colStats[adj].numHits;
+            bestAdjQty = adj;
+          }
+        }
+      }
+    }
+    if (bestAdjQty >= 0 && bestAdjHits >= 2) {
+      cols.qty = bestAdjQty;
       used.push(cols.qty);
     } else {
       cols.qty = pickBest("numHits", used);
       if (cols.qty >= 0) used.push(cols.qty);
     }
 
-    if (cols.code >= 0 && colStats[cols.code + 1]?.cnTextHits > 0 && !used.includes(cols.code + 1)) {
+    // 物资名称列（通常紧跟编码右侧）
+    if (cols.code >= 0 && cols.code + 1 < maxCols && colStats[cols.code + 1]?.cnTextHits > 0 && !used.includes(cols.code + 1)) {
       cols.name = cols.code + 1;
       used.push(cols.name);
     } else {
-      cols.name = pickBest("cnTextHits", used);
+      cols.name = pickBest("cnTextHits", used, (c, st) => st.statusHits < st.nonEmpty * 0.5);
       if (cols.name >= 0) used.push(cols.name);
     }
 
-    cols.remark = pickBest("cnTextHits", used);
-    if (cols.remark >= 0) cols.remarkCols = [cols.remark];
+    // 规格型号列（通常紧跟物资名称右侧，且位于单位/数量左侧）
+    if (cols.name >= 0 && cols.name + 1 < maxCols && !used.includes(cols.name + 1)) {
+      const nextSt = colStats[cols.name + 1];
+      if (nextSt.nonEmpty > 0 && nextSt.statusHits < nextSt.nonEmpty * 0.5 && nextSt.remarkKwHits < nextSt.nonEmpty * 0.5) {
+        cols.spec = cols.name + 1;
+        used.push(cols.spec);
+      }
+    }
+
+    // 备注列（排除“已开单”状态列，优先包含用途/位置关键词的列）
+    cols.remark = pickBest("remarkKwHits", used, (c, st) => st.statusHits < st.nonEmpty * 0.5);
+    if (cols.remark < 0) {
+      cols.remark = pickBest("cnTextHits", used, (c, st) => st.statusHits < st.nonEmpty * 0.5);
+    }
+    if (cols.remark >= 0) {
+      cols.remarkCols = [cols.remark];
+      used.push(cols.remark);
+    }
+
+    // 其余非状态列作为兜底列（保留在 fallbackTextCols，不干扰主备注）
+    for (let c = 0; c < maxCols; c++) {
+      if (!used.includes(c) && colStats[c].statusHits < colStats[c].nonEmpty * 0.5) {
+        cols.fallbackTextCols.push(c);
+      }
+    }
 
     if (cols.code >= 0 && cols.name >= 0) {
       return { headerRow: -1, dataStartRow: Math.max(0, firstCodeRow), cols, isHeaderless: true };
@@ -1637,7 +1833,7 @@ function detectHeaderAndCols(matrix) {
     return { headerRow: -1, dataStartRow: 0, cols, isHeaderless: false, failed: true };
   }
 
-  return { headerRow, dataStartRow: headerRow + 1, cols, isHeaderless: false, failed: false };
+  return { headerRow, dataStartRow: headerRow + headerRowSpan, cols, isHeaderless: false, failed: false };
 }
 
 function resolveDeptConfig(rawDept, rawPerson = "") {
@@ -1781,23 +1977,19 @@ function mergeNameAndSpec(rawName, rawSpec) {
 }
 
 function cleanRemark(rawRemark, deptStd) {
-  let r = kText(rawRemark);
-  if (!r) return "";
-  if (deptStd) {
-    const escaped = deptStd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    r = r.replace(new RegExp(`^${escaped}[\\s：:、\\-]*`), "");
-  }
-  return r.trim();
+  // v3.3 定稿：保留原始备注文本，不再自动删减车间前缀
+  return kText(rawRemark).trim();
 }
 
 // =========================================================================
 // 8. 单行物资归类与核算核心规则引擎
 // =========================================================================
 function classifyRow(raw, deptCfg, targetDate, origIdx) {
-  const code = kText(raw.code);
+  const code = normalizeMaterialCode(raw.code);
   const fullName = mergeNameAndSpec(raw.name, raw.spec);
-  const qtyNum = Number(raw.qty);
-  const qtyStr = isNaN(qtyNum) ? kText(raw.qty) : String(qtyNum);
+  const qtyParsed = parseQtyValue(raw.qty);
+  const qtyNum = qtyParsed === null ? NaN : qtyParsed;
+  const qtyStr = qtyParsed !== null ? formatQtyNum(qtyParsed) : kText(raw.qty);
   const unit = kText(raw.unit);
   let wh = kText(raw.warehouse);
   const remark = cleanRemark(raw.remark, deptCfg.std);
@@ -1915,7 +2107,7 @@ function classifyRow(raw, deptCfg, targetDate, origIdx) {
     } else if (isOffice) {
       usage = "办公用品";
       subject = "51010301";
-    } else if (deptCfg.type === "auto" && !/灭火器|消防/.test(fullName) && (/维修车辆|修车|车修|装载机|铲车|叉车|挖机|自卸车|吊车|货车|汽修/.test(allText) || /P2汽修/.test(fileNameCache))) {
+    } else if (deptCfg.type === "auto" && !/灭火器|消防/.test(fullName) && /维修车辆/.test(allText)) {
       usage = "汽修";
       subject = "51010606";
     } else {
@@ -2118,8 +2310,7 @@ async function handleMainFileChange(e) {
   try {
     wbBatchCache = [];
     for (const file of files) {
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      const wb = await readWorkbookSafe(file, { cellDates: true });
       const bestSheet = findBestSheetInWorkbook(wb);
       wbBatchCache.push({ fileName: file.name, wb, bestSheet });
     }
@@ -2197,8 +2388,16 @@ function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existing
   let carryPerson = meta.metaPerson || "";
   let carryDept = "";
 
+  // 第一阶段：按目标业务日期先行筛选所有有效行（不提前因旧 qtyCol 为空而丢行）
+  const matchedEntries = [];
   for (let r = det.dataStartRow; r < matrix.length; r++) {
     const row = matrix[r] || [];
+
+    const firstCellText = kText(row[0]);
+    if (/^(领料要求|注意事项|填写说明|备注说明)$/.test(firstCellText)) {
+      carryDate = "";
+      continue;
+    }
 
     if (c.date >= 0) {
       const rd = pDate(row[c.date]);
@@ -2218,10 +2417,8 @@ function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existing
 
     const code = c.code >= 0 ? kText(row[c.code]) : "";
     const name = c.name >= 0 ? kText(row[c.name]) : "";
-    const qtyRaw = c.qty >= 0 ? kText(row[c.qty]) : "";
     if (!code && !name) continue;
     if (/^(合计|总计|小计|制表|审核|批准|备注|领料人|序号)$/.test(name) || /^(合计|总计|小计)$/.test(code)) continue;
-    if (!qtyRaw && !code) continue;
 
     const rowDate = carryDate || meta.metaDate;
     if (rowDate) state.foundDates.add(rowDate);
@@ -2247,40 +2444,181 @@ function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existing
       }
     }
 
-    const remarkParts = [];
-    const seenParts = new Set();
-    let extractedUsageCode = "";
+    matchedEntries.push({ r, row, code, name, rawDeptCell, rowPerson, rowDeptCfg });
+  }
 
-    const pushRemarkVal = v => {
-      const s = kText(v);
-      if (!s) return;
+  if (matchedEntries.length === 0) return { failed: false };
+
+  // 第二阶段：基于目标日期行动态校准数量列（覆盖率 < 100% 时自动扫描所有候选数量列与单位相邻列）
+  const countPosHits = (colIdx) => {
+    if (colIdx < 0) return 0;
+    let hits = 0;
+    for (const ent of matchedEntries) {
+      const n = parseQtyValue(ent.row[colIdx]);
+      if (n !== null && n > 0) hits++;
+    }
+    return hits;
+  };
+
+  let lockedQtyCol = c.qty;
+  let lockedHits = countPosHits(lockedQtyCol);
+  const totalMatched = matchedEntries.length;
+
+  if (lockedQtyCol < 0 || lockedHits < totalMatched) {
+    const blockedCols = new Set(
+      [c.code, c.name, c.spec, c.date, c.dept, c.person, c.warehouse, c.unit, c.project, c.subitem, c.pickup, c.special].filter(x => x >= 0)
+    );
+    const maxCols = Math.max(
+      (c.colHeaders || []).length,
+      ...matchedEntries.map(e => (e.row || []).length)
+    );
+    const candidateColSet = new Set();
+    if (lockedQtyCol >= 0) candidateColSet.add(lockedQtyCol);
+    (c.qtyCandidates || []).forEach(qc => candidateColSet.add(qc.col));
+    if (c.unit >= 0) {
+      if (c.unit - 1 >= 0 && !blockedCols.has(c.unit - 1)) candidateColSet.add(c.unit - 1);
+      if (c.unit + 1 < maxCols && !blockedCols.has(c.unit + 1)) candidateColSet.add(c.unit + 1);
+    }
+    for (let colIdx = 0; colIdx < maxCols; colIdx++) {
+      if (blockedCols.has(colIdx)) continue;
+      const hdr = (c.colHeaders || [])[colIdx] || "";
+      if (hdr && isQtyHeaderExcluded(hdr)) continue;
+      candidateColSet.add(colIdx);
+    }
+
+    let bestCol = lockedQtyCol;
+    let bestHits = lockedHits;
+    let bestPrio = lockedQtyCol >= 0 ? qtyHeaderPriority((c.colHeaders || [])[lockedQtyCol] || "") : -99;
+    let bestDist = (c.unit >= 0 && lockedQtyCol >= 0) ? Math.abs(lockedQtyCol - c.unit) : 99;
+
+    for (const colIdx of candidateColSet) {
+      const hdr = (c.colHeaders || [])[colIdx] || "";
+      if (hdr && isQtyHeaderExcluded(hdr)) continue;
+      const hits = countPosHits(colIdx);
+      if (hits <= 0) continue;
+      const prio = hdr ? qtyHeaderPriority(hdr) : (c.unit >= 0 && Math.abs(colIdx - c.unit) === 1 ? 50 : 10);
+      const dist = c.unit >= 0 ? Math.abs(colIdx - c.unit) : 99;
+
+      if (
+        hits > bestHits ||
+        (hits === bestHits && prio > bestPrio) ||
+        (hits === bestHits && prio === bestPrio && dist < bestDist)
+      ) {
+        bestCol = colIdx;
+        bestHits = hits;
+        bestPrio = prio;
+        bestDist = dist;
+      }
+    }
+
+    if (bestCol >= 0 && bestHits > 0) {
+      lockedQtyCol = bestCol;
+      lockedHits = bestHits;
+    }
+  }
+
+  if (lockedQtyCol >= 0) {
+    const hdrTitle = ((c.colHeaders || [])[lockedQtyCol] || "无表头列").slice(0, 14);
+    const colLetter = colIndexToLetter(lockedQtyCol);
+    if (!state.qtyLockNotes) state.qtyLockNotes = [];
+    state.qtyLockNotes.push(`${colLetter}列「${hdrTitle}」(${lockedHits}/${totalMatched})`);
+  }
+
+  // 第三阶段：确定最长有效备注列（primaryRemarkCol），原样保留其文本
+  const rCols = (c.remarkCols && c.remarkCols.length > 0) ? c.remarkCols : (c.remark >= 0 ? [c.remark] : []);
+  let primaryRemarkCol = rCols.length > 0 ? rCols[0] : -1;
+  if (rCols.length > 1) {
+    let bestScore = -1;
+    for (const rc of rCols) {
+      let charSum = 0;
+      for (const ent of matchedEntries) {
+        const s = kText(ent.row[rc]);
+        if (s && !/^(无|配送|206|311|\d{1,4})$/.test(s)) charSum += s.length;
+      }
+      if (charSum > bestScore) {
+        bestScore = charSum;
+        primaryRemarkCol = rc;
+      }
+    }
+  }
+
+  const isJunkFallbackRemark = (s) => {
+    if (!s) return true;
+    if (/^(无|没有|配送|送货|206|311|207|P3|GD1)$/i.test(s)) return true;
+    if (/^\d{1,4}(\.\d+)?$/.test(s)) return true;
+    if (pDate(s)) return true;
+    if (s.length <= 1 && !/[\u4e00-\u9fa5]/.test(s)) return true;
+    return false;
+  };
+
+  for (const ent of matchedEntries) {
+    const { r, row, code, name, rawDeptCell, rowPerson, rowDeptCfg } = ent;
+    const qtyCellVal = lockedQtyCol >= 0 ? row[lockedQtyCol] : "";
+    const qtyParsed = parseQtyValue(qtyCellVal);
+    const qtyRaw = qtyParsed !== null ? formatQtyNum(qtyParsed) : kText(qtyCellVal);
+    if (!qtyRaw && !code) continue;
+
+    // 全列扫描「自取/自提/补单/补领/补开/已领取」
+    let pickupVal = c.pickup >= 0 ? kText(row[c.pickup]) : "";
+    if (!pickupVal) {
+      for (let ci = 0; ci < row.length; ci++) {
+        const cv = kText(row[ci]);
+        if (!cv) continue;
+        if (/(补单|补领|补开|已领取)/.test(cv)) { pickupVal = "补单"; break; }
+        if (/(自取|自提)/.test(cv)) { pickupVal = "自取"; break; }
+      }
+    }
+
+    let extractedUsageCode = "";
+    let finalRemark = "";
+
+    // 维修车间专用纯数字编码提取（仅限维修车间）
+    const checkMaintCode = (val) => {
+      const s = kText(val);
       if (rowDeptCfg.type === "maint" && isPureNumericSpecialCode(s)) {
         if (!extractedUsageCode) extractedUsageCode = s;
-        return;
+        return true;
       }
-      if (!seenParts.has(s)) {
-        seenParts.add(s);
-        remarkParts.push(s);
-      }
+      return false;
     };
 
-    const rCols = (c.remarkCols && c.remarkCols.length > 0) ? c.remarkCols : (c.remark >= 0 ? [c.remark] : []);
-    for (const rc of rCols) {
-      pushRemarkVal(row[rc]);
-    }
-    if (remarkParts.length === 0 && c.fallbackTextCols && c.fallbackTextCols.length > 0) {
-      for (const fc of c.fallbackTextCols) {
-        const fv = kText(row[fc]);
-        if (!fv) continue;
-        if (/^\d+(\.\d+)?$/.test(fv) && !isPureNumericSpecialCode(fv)) continue;
-        if (pDate(fv)) continue;
-        if (fv.length <= 1 && !/[\u4e00-\u9fa5]/.test(fv)) continue;
-        pushRemarkVal(fv);
+    // 1. 优先原样取最长主备注列
+    if (primaryRemarkCol >= 0) {
+      const pv = kText(row[primaryRemarkCol]);
+      if (pv && !checkMaintCode(pv) && pv !== "无") {
+        finalRemark = pv;
       }
     }
-    if (remarkParts.length === 0 && rowDeptCfg._personMatched && rawDeptCell && !isPureNumericSpecialCode(rawDeptCell)) {
-      if (rawDeptCell !== rowDeptCfg.std && !rowDeptCfg.keys?.some(k => k.toUpperCase() === rawDeptCell.toUpperCase())) {
-        pushRemarkVal(rawDeptCell);
+
+    // 2. 主备注列为空或为“无”时，才回退其他备注列与未占用文本列（并过滤无/配送/206/311/短数字）
+    if (!finalRemark) {
+      const altParts = [];
+      const seen = new Set();
+      const tryAdd = (v) => {
+        const s = kText(v);
+        if (!s || checkMaintCode(s) || isJunkFallbackRemark(s)) return;
+        if (!seen.has(s)) { seen.add(s); altParts.push(s); }
+      };
+      for (const rc of rCols) {
+        if (rc === primaryRemarkCol) continue;
+        tryAdd(row[rc]);
+      }
+      if (altParts.length === 0 && c.fallbackTextCols && c.fallbackTextCols.length > 0) {
+        for (const fc of c.fallbackTextCols) {
+          if (fc === lockedQtyCol) continue;
+          tryAdd(row[fc]);
+        }
+      }
+      if (altParts.length === 0 && rowDeptCfg._personMatched && rawDeptCell && !isPureNumericSpecialCode(rawDeptCell)) {
+        if (rawDeptCell !== rowDeptCfg.std && !rowDeptCfg.keys?.some(k => k.toUpperCase() === rawDeptCell.toUpperCase())) {
+          tryAdd(rawDeptCell);
+        }
+      }
+      finalRemark = altParts.join(" ");
+    } else if (rowDeptCfg.type === "maint" && !extractedUsageCode) {
+      // 维修车间即使主备注列有值，也检查其余备注列是否含纯数字使用位置编码
+      for (const rc of rCols) {
+        checkMaintCode(row[rc]);
       }
     }
 
@@ -2292,20 +2630,19 @@ function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existing
       unit: c.unit >= 0 ? kText(row[c.unit]) : "",
       warehouse: c.warehouse >= 0 ? kText(row[c.warehouse]) : "",
       person: rowPerson,
-      remark: remarkParts.join(" "),
+      remark: finalRemark,
       usageCode: extractedUsageCode || (c.usageCode >= 0 ? kText(row[c.usageCode]) : ""),
       rawDept: rawDeptCell,
       project: c.project >= 0 ? kText(row[c.project]) : "",
-      pickup: c.pickup >= 0 ? kText(row[c.pickup]) : "",
+      pickup: pickupVal,
       special: c.special >= 0 ? kText(row[c.special]) : ""
     }, rowDeptCfg, targetDate, origOffset + r);
 
-    const fp = `${item.date}|${item.dept}|${item.code}|${item.qty}|${item.name}`;
+    const fp = `${item.date}|${item.dept}|${item.code}|${item.qty}|${item.name}|${item.remark || ""}`;
     if (dedupEnabled && existingKeys.has(fp)) {
       state.dupSkipped++;
       continue;
     }
-    existingKeys.add(fp);
     state.candidates.push(item);
   }
   return { failed: false };
@@ -2321,7 +2658,7 @@ function runAudit() {
   if (!targetDate) return setStatusBox("error", "❌ 请先填写目标业务日期。");
 
   const existingKeys = new Set(
-    masterRecords.filter(r => !r._isBlank).map(r => `${r.date}|${r.dept}|${r.code}|${r.qty}|${r.name}`)
+    masterRecords.filter(r => !r._isBlank).map(r => `${r.date}|${r.dept}|${r.code}|${r.qty}|${r.name}|${r.remark || ""}`)
   );
 
   const state = {
@@ -2331,7 +2668,8 @@ function runAudit() {
     dupSkipped: 0,
     excludedSkipped: 0,
     anyHeaderless: false,
-    filesProcessed: 0
+    filesProcessed: 0,
+    qtyLockNotes: []
   };
 
   const isBatchMode = wbBatchCache.length > 1 && sheetName === "__BATCH_AUTO__";
@@ -2384,7 +2722,10 @@ function runAudit() {
     ).join("");
     alertHtml = `<div class="mt-2 pt-2 border-t border-emerald-200 text-amber-900">⚠️ <b>人员变动提醒</b>：检测到 ${unknownPersons.size} 位未在领料人对照表登记的人员（系统已暂按表头/部门列归类），点击可快速绑定车间与英文前缀：${btns}</div>`;
   }
-  setStatusBox("ok", `✅ 核算完成${modeNote}！本次放行 <b>${candidates.length}</b> 条有效领料行（含自动插入组间空行，共渲染 ${workRows.length} 行）并已实时归档至历史底表总账。${dupSkipped > 0 ? ` 已自动拦截重复 ${dupSkipped} 条。` : ""}${excludedSkipped > 0 ? ` 已过滤非 HJF/王雷 ${excludedSkipped} 条。` : ""}${pgHitCount > 0 ? ` 命中 P3/GD1 库存 ${pgHitCount} 条。` : ""}${alertHtml}`);
+  const qtyLockHtml = (state.qtyLockNotes && state.qtyLockNotes.length)
+    ? ` <span class="text-blue-700 font-semibold">[锁定数量列: ${escapeHtml(state.qtyLockNotes.slice(0, 4).join(" / "))}]</span>`
+    : "";
+  setStatusBox("ok", `✅ 核算完成${modeNote}！本次放行 <b>${candidates.length}</b> 条有效领料行（含自动插入组间空行，共渲染 ${workRows.length} 行）并已实时归档至历史底表总账。${qtyLockHtml}${dupSkipped > 0 ? ` 已自动拦截重复 ${dupSkipped} 条。` : ""}${excludedSkipped > 0 ? ` 已过滤非 HJF/王雷 ${excludedSkipped} 条。` : ""}${pgHitCount > 0 ? ` 命中 P3/GD1 库存 ${pgHitCount} 条。` : ""}${alertHtml}`);
 }
 
 // =========================================================================
