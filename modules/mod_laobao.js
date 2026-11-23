@@ -69,6 +69,7 @@
       const qty = iQty >= 0 ? U.parseNum(r[iQty]) : 1;
       const status = iStatus >= 0 ? U.cleanStr(r[iStatus]) : '';
       if (!person && !item) continue;
+      if (/^(合计|总计|小计)$/.test(dept) || /^(合计|总计|小计)$/.test(person)) continue;
 
       // 实验区专属规则：自动剔除纸类非劳保项，仅保留劳保物资
       if (EXCLUDE_NON_LAOBAO.some(k => item.includes(k))) {
@@ -91,6 +92,7 @@
     state.excludedCount = excluded;
     state.depts = Array.from(deptSet).sort();
     state.summaryRows = Array.from(agg.values()).map(o => [o.dept, o.person, o.item, U.fmtNum(o.qty), o.count, o.status]);
+    state.deptFilter = 'ALL';
     state.fileName = file.name;
     state.page = 1;
     persistState();
@@ -131,7 +133,13 @@
 
     const inp = root.querySelector('#l-in');
     root.querySelector('#l-up').onclick = () => inp.click();
-    inp.onchange = async e => { if (e.target.files[0]) { await loadLaobaoFile(e.target.files[0]); renderModule(root); } e.target.value = ''; };
+    inp.onchange = async e => {
+      if (e.target.files[0]) {
+        try { await loadLaobaoFile(e.target.files[0]); renderModule(root); }
+        catch (err) { U.toast('劳保表导入失败：' + err.message, 'error'); }
+      }
+      e.target.value = '';
+    };
     root.querySelector('#l-dept').onchange = e => { state.deptFilter = e.target.value; state.page = 1; renderModule(root); };
     root.querySelector('#l-copy').onclick = async () => {
       await U.copyAsTSV(['部门/车间', '领用人', '劳保物资', '累计发放数量', '领取次数', '状态/备注'], filtered, true);

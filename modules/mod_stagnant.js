@@ -114,21 +114,25 @@
     const colTitle = state.periodLabel.trim() || `本期出库数量`;
     const flowByWhCode = new Map();
     let flowCount = 0;
-    const consumeLog = [];
+    const rawFlowEntries = [];
 
     for (let i = hdrIdx + 1; i < aoa.length; i++) {
       const r = aoa[i];
       const code = U.formatCode(r[iCode], true);
       const qty = U.parseNum(r[iQty]);
-      if (!code || Math.abs(qty) < 1e-9) continue;
+      if (!code || /合计|总计/.test(code) || Math.abs(qty) < 1e-9) continue;
       flowCount++;
       const wh = iWh >= 0 ? U.cleanStr(r[iWh]) : '';
       const key = `${wh}||${code}`;
       flowByWhCode.set(key, (flowByWhCode.get(key) || 0) + qty);
-      consumeLog.push([iDate >= 0 ? U.formatDate(r[iDate]) : '', wh, code, iName >= 0 ? U.cleanStr(r[iName]) : '', qty]);
+      rawFlowEntries.push({
+        key,
+        row: [iDate >= 0 ? U.formatDate(r[iDate]) : '', wh, code, iName >= 0 ? U.cleanStr(r[iName]) : '', qty]
+      });
     }
 
     let matched = 0;
+    const matchedFlowKeys = new Set();
     state.sheetNames.forEach(sn => {
       if (sn.includes('消耗') || sn.includes('统计')) return;
       const sh = state.baseSheets[sn];
@@ -140,20 +144,25 @@
       const groups = new Map();
       sh.rows.forEach((row, rIdx) => {
         while (row.length < sh.headers.length) row.push('');
-        const code = U.formatCode(row[codeCol], true);
+        const rawCode = U.cleanStr(row[codeCol]);
+        if (!rawCode || /合计|总计/.test(rawCode)) return;
+        const code = U.formatCode(rawCode, true);
         row[codeCol] = code;
         if (!code) return;
         if (!groups.has(code)) groups.set(code, []);
         groups.get(code).push(rIdx);
       });
 
+      const cleanSn = sn.replace(/呆滞.*/, '').trim();
       groups.forEach((rIndices, code) => {
-        // 匹配同仓库或全局流水
+        // 匹配同仓库或无仓库标识的全局流水（避免 cleanSn 为空时跨仓误匹配）
         let delta = 0;
         for (const [k, v] of flowByWhCode.entries()) {
           const [fWh, fCode] = k.split('||');
-          if (fCode === code && (!fWh || sn.includes(fWh) || fWh.includes(sn.replace(/呆滞.*/, '')))) {
+          const whMatch = !fWh || sn.includes(fWh) || (cleanSn && fWh.includes(cleanSn));
+          if (fCode === code && whMatch) {
             delta += v;
+            matchedFlowKeys.add(k);
           }
         }
         if (Math.abs(delta) < 1e-9) return;
@@ -187,6 +196,7 @@
       });
     });
 
+    const consumeLog = rawFlowEntries.filter(e => matchedFlowKeys.has(e.key)).map(e => e.row);
     state.flowCount = flowCount;
     state.matchedCount = matched;
     state.consumeLog = consumeLog;
@@ -226,7 +236,7 @@
       </div>
     `;
 
-    root.querySelector('#s-period').onchange = e => { state.periodLabel = e.target.value; };
+    root.querySelector('#s-period').oninput = e => { state.periodLabel = e.target.value; };
     const inBase = root.querySelector('#s-in-base');
     root.querySelector('#s-up-base').onclick = () => inBase.click();
     inBase.onchange = async e => { if (e.target.files[0]) { await loadBaseFile(e.target.files[0]); renderModule(root); } e.target.value = ''; };

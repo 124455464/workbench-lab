@@ -34,7 +34,7 @@
 
     aoa.forEach((row, idx) => {
       const cleaned = row.map(v => U.cleanStr(v));
-      if (idx === 0 && (cleaned[0] === '车间' || cleaned[0] === '部门')) return;
+      if (idx === 0 && (cleaned[0] === '车间' || cleaned[0] === '部门' || cleaned[0] === '领料部门')) return;
       if (cleaned.every(v => v === '')) {
         if (cur.length) { rawBlocks.push(cur); cur = []; }
       } else {
@@ -171,7 +171,17 @@
     const inMedia = root.querySelector('#p-in-media');
     root.querySelector('#p-up-media').onclick = () => inMedia.click();
     const drop = root.querySelector('#p-media-drop');
-    if (drop) drop.onclick = () => inMedia.click();
+    if (drop) {
+      drop.onclick = () => inMedia.click();
+      drop.ondragover = e => { e.preventDefault(); drop.classList.add('dragover'); };
+      drop.ondragleave = () => drop.classList.remove('dragover');
+      drop.ondrop = async e => {
+        e.preventDefault();
+        drop.classList.remove('dragover');
+        await loadMediaFiles(Array.from(e.dataTransfer.files || []));
+        renderModule(root);
+      };
+    }
     inMedia.onchange = async e => {
       await loadMediaFiles(Array.from(e.target.files || []));
       renderModule(root);
@@ -195,8 +205,8 @@
 
     root.querySelector('#p-copy-missing').onclick = async () => {
       const lines = missing.map(t => `${t.dept} | ${t.tag} | ` + t.items.map(i => `${i.name}(${i.qty}${i.unit})`).join('、'));
-      await navigator.clipboard.writeText(lines.join('\n'));
-      U.toast(`已复制 ${lines.length} 条缺照片单据明细`, 'success');
+      const ok = await U.copyText(lines.join('\n'));
+      U.toast(ok ? `已复制 ${lines.length} 条缺照片单据明细` : '复制失败，请检查剪贴板权限', ok ? 'success' : 'error');
     };
   }
 

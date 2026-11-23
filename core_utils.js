@@ -267,11 +267,20 @@
         const d = new Date(Math.round((val - 25569) * 86400 * 1000));
         if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
       }
-      const s = Utils.cleanStr(val).replace(/\//g, '-');
-      const m = s.match(/(\d{4}-\d{1,2}-\d{1,2})/);
-      if (m) {
-        const parts = m[1].split('-');
-        return `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+      const s = Utils.cleanStr(val)
+        .replace(/年|月/g, '-')
+        .replace(/日/g, '')
+        .replace(/[\/.]/g, '-');
+      // YYYY-M-D
+      const m1 = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+      if (m1) {
+        return `${m1[1]}-${m1[2].padStart(2, '0')}-${m1[3].padStart(2, '0')}`;
+      }
+      // SheetJS raw:false 美式短日期 M-D-YY 或 M-D-YYYY
+      const m2 = s.match(/^(\d{1,2})-(\d{1,2})-(\d{2,4})(?:\s|$)/);
+      if (m2) {
+        const yr = m2[3].length === 2 ? `20${m2[3]}` : m2[3];
+        return `${yr}-${m2[1].padStart(2, '0')}-${m2[2].padStart(2, '0')}`;
       }
       return s;
     },
@@ -299,9 +308,15 @@
 
     async readSpreadsheet(file) {
       const buf = await file.arrayBuffer();
-      const headText = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(buf.slice(0, 512))).toLowerCase();
+      const headText = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(buf.slice(0, 2048))).toLowerCase();
       if (headText.includes('<html') || headText.includes('<table')) {
-        const fullText = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(buf));
+        let fullText = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(buf));
+        // 兼容 ERP 导出的 GBK/GB18030 编码 HTML 伪装 .xls
+        if ((fullText.match(/\uFFFD/g) || []).length >= 3) {
+          try {
+            fullText = new TextDecoder('gb18030', { fatal: false }).decode(new Uint8Array(buf));
+          } catch { /* fallback to utf-8 */ }
+        }
         const doc = new DOMParser().parseFromString(fullText, 'text/html');
         const tables = Array.from(doc.querySelectorAll('table'));
         const sheets = {};
@@ -356,15 +371,7 @@
       XLSX.writeFile(wb, fileName);
     },
 
-    async copyAsTSV(headers, rows, includeHeader = false) {
-      const lines = [];
-      if (includeHeader && headers) {
-        lines.push(headers.map(h => String(h ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t'));
-      }
-      for (const row of rows) {
-        lines.push(row.map(v => String(v ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t'));
-      }
-      const text = lines.join('\n');
+    async copyText(text) {
       try {
         await navigator.clipboard.writeText(text);
         return true;
@@ -379,6 +386,17 @@
         document.body.removeChild(ta);
         return ok;
       }
+    },
+
+    async copyAsTSV(headers, rows, includeHeader = false) {
+      const lines = [];
+      if (includeHeader && headers) {
+        lines.push(headers.map(h => String(h ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t'));
+      }
+      for (const row of rows) {
+        lines.push(row.map(v => String(v ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t'));
+      }
+      return Utils.copyText(lines.join('\n'));
     },
 
     renderPagedTable(container, { headers, rows, page = 1, pageSize = 100, rowClassFn, cellRenderFn, onPageChange }) {

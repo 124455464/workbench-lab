@@ -19,7 +19,7 @@
   ];
   const KEEP_TOOL_WORDS = ['表', '管', '阀', '枪'];
   const QUICK_REASONS = ['车间未签回', '今日未送达', '补交中', '现场自取未标', '黄单遗失待补'];
-  const DOC_REGEX = /\b(?:CCHF|CK)\d{10,22}\b/gi;
+  const DOC_REGEX = /(?:CCHF|CK)\d{10,22}/gi;
 
   let state = {
     mainRows: [],       // 16列完整原表（行顺序100%锁死）
@@ -366,11 +366,12 @@
         U.toast('未检测到有效的 CCHF/CK 单据号', 'warn');
         return;
       }
-      matches.forEach(m => state.recoveredSet.add(m.toUpperCase()));
+      const uniqueDocs = Array.from(new Set(matches.map(m => m.toUpperCase())));
+      uniqueDocs.forEach(m => state.recoveredSet.add(m));
       applyYellowAndReasons();
-      state.pdfLog = `✅ 手动导入 ${matches.length} 个已回收单号，当前累计 ${state.recoveredSet.size} 个。`;
+      state.pdfLog = `✅ 手动导入 ${uniqueDocs.length} 个去重已回收单号，当前累计 ${state.recoveredSet.size} 个。`;
       persistState();
-      U.toast(`已回填 ${matches.length} 个已回收单号到 N 列`, 'success');
+      U.toast(`已回填 ${uniqueDocs.length} 个已回收单号到 N 列`, 'success');
       renderModule(root);
     };
 
@@ -411,8 +412,8 @@
     root.querySelector('#btn-exp-xlsx').onclick = () => {
       const outName = `材料出库单列表（精简与黄单核对）.xlsx`;
       U.exportWorkbook([
-        { name: '材料出库单列表', headers: HEADERS_16, rows: state.mainRows, textCols: [2, 6, 15], numCols: [9], colWidths: COL_WIDTHS },
-        { name: '自取物资', headers: HEADERS_16, rows: state.selfRows, textCols: [2, 6, 15], numCols: [9], colWidths: COL_WIDTHS }
+        { name: '材料出库单列表', headers: HEADERS_16, rows: state.mainRows, textCols: [1, 2, 6, 15], numCols: [9], colWidths: COL_WIDTHS },
+        { name: '自取物资', headers: HEADERS_16, rows: state.selfRows, textCols: [1, 2, 6, 15], numCols: [9], colWidths: COL_WIDTHS }
       ], outName);
       U.toast('已导出：' + outName, 'success');
     };
@@ -468,6 +469,7 @@
         res.found.forEach(d => state.recoveredSet.add(d));
         applyYellowAndReasons();
         state.pdfLog = `✅ 智能导入 ${pdfs.length} 个 PDF，识别 ${res.found.size} 个单号并自动回填 N 列。`;
+        persistState();
       }
       if (this._root) renderModule(this._root);
     }

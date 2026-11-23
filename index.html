@@ -265,7 +265,7 @@
         });
       }
 
-      function switchTab(id, autoFiles = null) {
+      async function switchTab(id, autoFiles = null) {
         if (!WB.modules[id]) return;
         activeId = id;
         try { localStorage.setItem('wb_lab_exp_active_tab', id); } catch {}
@@ -273,10 +273,10 @@
         const main = document.getElementById('main-container');
         main.innerHTML = '';
         try {
-          WB.modules[id].mount(main);
+          await WB.modules[id].mount(main);
           delete modErrors[id];
           if (autoFiles && autoFiles.length && typeof WB.modules[id].handleIncomingFiles === 'function') {
-            WB.modules[id].handleIncomingFiles(autoFiles);
+            await WB.modules[id].handleIncomingFiles(autoFiles);
           }
         } catch (err) {
           modErrors[id] = err.message;
@@ -333,6 +333,10 @@
         }
 
         // 兜底：读取首个 Excel 表头自动判断
+        if (!excels.length) {
+          WB.Utils.toast('未识别的文件格式，请拖入 Excel (.xlsx/.xls/.csv)、PDF 或照片', 'warn');
+          return;
+        }
         try {
           const parsed = await WB.Utils.readSpreadsheet(excels[0]);
           const firstSheet = parsed.sheets[parsed.sheetNames[0]] || [];

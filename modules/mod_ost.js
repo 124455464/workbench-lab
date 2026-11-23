@@ -174,9 +174,9 @@
 
     // 综合仓置顶 (0) -> 其他仓居中 (1) -> P3/P7/P9/110105/110110 沉底 (2)
     function getBucket(row) {
-      const locTxt = `${row[iLoc] || ''} ${iAltLoc >= 0 ? row[iAltLoc] : ''}`.toUpperCase();
-      if (/P3|P7|P9|110105|110110/.test(locTxt)) return 2;
       const whTxt = iWh >= 0 ? (row[iWh] || '') : '';
+      const locTxt = `${row[iLoc] || ''} ${iAltLoc >= 0 ? row[iAltLoc] : ''} ${whTxt}`.toUpperCase();
+      if (/P3|P7|P9|110105|110110/.test(locTxt)) return 2;
       if (whTxt.includes('综合仓')) return 0;
       return 1;
     }
@@ -214,6 +214,7 @@
       const code = iCode >= 0 ? U.formatCode(r[iCode]) : '';
       const name = iName >= 0 ? U.cleanStr(r[iName]) : '';
       if (!code && !name) continue;
+      if (/^(合计|总计|小计|制单|审核|审批|主管|领料人)/.test(code || name)) continue;
       const reqQty = iQty >= 0 ? U.parseNum(r[iQty]) : 0;
       const matches = state.stockMap.get(code) || [];
       const totalStock = matches.reduce((s, m) => s + m.qty, 0);
@@ -302,12 +303,24 @@
 
     const inStock = root.querySelector('#o-in-stock');
     root.querySelector('#o-up-stock').onclick = () => inStock.click();
-    inStock.onchange = async e => { if (e.target.files[0]) { await loadStockFile(e.target.files[0]); renderModule(root); } e.target.value = ''; };
+    inStock.onchange = async e => {
+      if (e.target.files[0]) {
+        try { await loadStockFile(e.target.files[0]); renderModule(root); }
+        catch (err) { U.toast('现存量导入失败：' + err.message, 'error'); }
+      }
+      e.target.value = '';
+    };
 
     if (state.subTab === 'daily') {
       const inDaily = root.querySelector('#o-in-daily');
       root.querySelector('#o-up-daily').onclick = () => inDaily.click();
-      inDaily.onchange = async e => { if (e.target.files[0]) { await loadDailyFile(e.target.files[0]); renderModule(root); } e.target.value = ''; };
+      inDaily.onchange = async e => {
+        if (e.target.files[0]) {
+          try { await loadDailyFile(e.target.files[0]); renderModule(root); }
+          catch (err) { U.toast('申报单导入失败：' + err.message, 'error'); }
+        }
+        e.target.value = '';
+      };
       root.querySelector('#o-daily-date').onchange = e => {
         state.dailyTargetDate = e.target.value;
         state.dailyPage = 1;
@@ -346,7 +359,13 @@
     } else {
       const inReq = root.querySelector('#o-in-req');
       root.querySelector('#o-up-req').onclick = () => inReq.click();
-      inReq.onchange = async e => { if (e.target.files[0]) { await auditRequisitionFile(e.target.files[0]); renderModule(root); } e.target.value = ''; };
+      inReq.onchange = async e => {
+        if (e.target.files[0]) {
+          try { await auditRequisitionFile(e.target.files[0]); renderModule(root); }
+          catch (err) { U.toast('P9 领料单核对失败：' + err.message, 'error'); }
+        }
+        e.target.value = '';
+      };
       root.querySelector('#o-exp').onclick = () => {
         U.exportWorkbook([{ name: '现存量核对', headers: AUDIT_HEADERS, rows: state.auditRows, textCols: [1], numCols: [5, 6] }], 'OST_P9_现存量核对结果.xlsx');
         U.toast('已导出 OST_P9_现存量核对结果.xlsx', 'success');
