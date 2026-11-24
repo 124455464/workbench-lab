@@ -8,33 +8,73 @@
   const GAS_KEYWORDS = ['氧气', '乙炔', '二氧化碳', '氩气', '氮气', '丙烷', '液化气', '混合气', '丁烷气', '丁烷'];
 
   let state = {
-    tickets: [],        // [{ id, dept, rec, wh, tag, items: [{code,name,qty,unit}], checked: false }]
+    tickets: [],        // [{ id, date, dept, rec, wh, tag, items: [{code,name,qty,unit}], checked: false }]
+    availDates: [],
+    targetDate: '',
+    sheetName: '',
     mediaUrls: [],      // [{ name, url }]
     activeMediaIdx: 0,
     hideChecked: false
   };
 
   function persistState() {
-    WB.Store.save('mod_photo_check', { tickets: state.tickets, hideChecked: state.hideChecked });
+    WB.Store.save('mod_photo_check', {
+      tickets: state.tickets,
+      availDates: state.availDates,
+      targetDate: state.targetDate,
+      sheetName: state.sheetName,
+      hideChecked: state.hideChecked
+    });
   }
 
   async function hydrateState() {
     const saved = await WB.Store.load('mod_photo_check');
     if (saved) {
       state.tickets = saved.tickets || [];
+      state.availDates = saved.availDates || [];
+      state.targetDate = saved.targetDate || '';
+      state.sheetName = saved.sheetName || '';
       state.hideChecked = !!saved.hideChecked;
     }
   }
 
   async function loadTicketsFile(file) {
     const parsed = await U.readSpreadsheet(file);
-    const aoa = parsed.sheets[parsed.sheetNames[0]] || [];
+    // 若存在多工作表（如 HJF标准14列 + 历史出库底表总账），自动优先选取非空行数最多的有效工作表
+    let bestSn = parsed.sheetNames[0];
+    let bestCount = -1;
+    for (const sn of parsed.sheetNames) {
+      const rows = parsed.sheets[sn] || [];
+      const nonEmpty = rows.filter(r => r.some(v => U.cleanStr(v) !== '')).length;
+      if (nonEmpty > bestCount) {
+        bestCount = nonEmpty;
+        bestSn = sn;
+      }
+    }
+    const aoa = parsed.sheets[bestSn] || [];
+    const firstCleaned = (aoa[0] || []).map(v => U.cleanStr(v));
+    const hasHeader = /^(日期|车间|部门|领料部门)$/.test(firstCleaned[0] || '') ||
+      (firstCleaned.includes('车间') && firstCleaned.includes('仓库'));
+
+    // 自动检测第 0 列是否为「日期」列（如 历史出库底表总账），动态偏移列索引
+    let hasDateCol = firstCleaned[0] === '日期' || firstCleaned[0].includes('日期');
+    if (!hasDateCol) {
+      for (let i = hasHeader ? 1 : 0; i < Math.min(10, aoa.length); i++) {
+        const c0 = U.cleanStr((aoa[i] || [])[0]);
+        if (c0) {
+          if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}/.test(c0)) hasDateCol = true;
+          break;
+        }
+      }
+    }
+    const off = hasDateCol ? 1 : 0;
+
     const rawBlocks = [];
     let cur = [];
 
     aoa.forEach((row, idx) => {
       const cleaned = row.map(v => U.cleanStr(v));
-      if (idx === 0 && (cleaned[0] === '车间' || cleaned[0] === '部门' || cleaned[0] === '领料部门')) return;
+      if (idx === 0 && hasHeader) return;
       if (cleaned.every(v => v === '')) {
         if (cur.length) { rawBlocks.push(cur); cur = []; }
       } else {
@@ -44,32 +84,38 @@
     if (cur.length) rawBlocks.push(cur);
 
     const tickets = [];
+    const dateSet = new Set();
     rawBlocks.forEach((rows, bIdx) => {
-      const dept = rows[0][0] || '未知车间';
-      const rec = rows[0][1] || '';
-      const wh = (rows[0][2] || '').replace(/（.*）$/, '');
-      const sp = rows[0][13] || '';
-      const zq = rows[0][12] || '';
+      const dateStr = hasDateCol ? U.formatDate(rows[0][0]) : '';
+      if (dateStr) dateSet.add(dateStr);
+      const dept = rows[0][off + 0] || '未知车间';
+      const rec = rows[0][off + 1] || '';
+      const wh = (rows[0][off + 2] || '').replace(/（.*）$/, '');
+      const sp = rows[0][off + 13] || '';
+      const zq = rows[0][off + 12] || '';
       const tag = (sp || zq) ? `${wh}（${sp || zq}）` : wh;
 
       const items = [];
       for (const r of rows) {
-        const code = r[3] || '';
-        const name = r[4] || '';
-        const qty = r[5] || '';
-        const unit = r[6] || '';
+        const code = U.formatCode(r[off + 3] || '');
+        const name = r[off + 4] || '';
+        const qty = r[off + 5] || '';
+        const unit = r[off + 6] || '';
         if (!name) continue;
         if (GAS_KEYWORDS.some(g => name.includes(g))) continue; // 强制剔除气体含丁烷气罐
         items.push({ code, name, qty, unit });
       }
       if (items.length > 0) {
-        tickets.push({ id: bIdx + 1, dept, rec, wh, tag, items, checked: false });
+        tickets.push({ id: bIdx + 1, date: dateStr, dept, rec, wh, tag, items, checked: false });
       }
     });
 
     state.tickets = tickets;
+    state.availDates = Array.from(dateSet).sort().reverse();
+    state.targetDate = '';
+    state.sheetName = bestSn;
     persistState();
-    U.toast(`按空行切分出 ${tickets.length} 张非气体独立单据（已自动剔除全部气体）`, 'success');
+    U.toast(`从 [${bestSn}] 按空行切分出 ${tickets.length} 张非气体独立单据（已自动剔除全部气体）`, 'success');
   }
 
   async function loadMediaFiles(files) {
@@ -94,23 +140,32 @@
   }
 
   function renderModule(root) {
-    const total = state.tickets.length;
-    const done = state.tickets.filter(t => t.checked).length;
-    const missing = state.tickets.filter(t => !t.checked);
-    const listToShow = state.hideChecked ? missing : state.tickets;
+    const scopedTickets = state.targetDate
+      ? state.tickets.filter(t => t.date === state.targetDate)
+      : state.tickets;
+    const total = scopedTickets.length;
+    const done = scopedTickets.filter(t => t.checked).length;
+    const missing = scopedTickets.filter(t => !t.checked);
+    const listToShow = state.hideChecked ? missing : scopedTickets;
     const curMedia = state.mediaUrls[state.activeMediaIdx];
 
     root.innerHTML = `
       <div class="panel">
         <div class="panel-title">
           <span>📸 当天出库照片 / 扫描PDF 同屏核对（自动剔除含丁烷气罐在内的全部气体）</span>
-          <span class="pill ${missing.length ? 'pill-red' : 'pill-green'}">待核对缺单：${missing.length} / ${total}</span>
+          <span class="pill ${missing.length ? 'pill-red' : 'pill-green'}">待核对缺单：${missing.length} / ${total}${state.sheetName ? ` · 表:${state.sheetName}` : ''}</span>
         </div>
         <div class="toolbar">
           <button class="btn btn-primary" id="p-up-csv">📂 1. 导入当天出库清单 (CSV/XLSX)</button>
           <input type="file" id="p-in-csv" accept=".csv,.xlsx,.xls" class="hidden-input" />
           <button class="btn btn-warning" id="p-up-media">🖼️ 2. 导入现场照片 / 扫描PDF</button>
           <input type="file" id="p-in-media" accept="image/*,.pdf" multiple class="hidden-input" />
+          ${state.availDates.length > 0 ? `
+            <select id="p-date-sel" title="按表格内自然日筛选">
+              <option value="">全部日期 (${state.tickets.length} 单)</option>
+              ${state.availDates.map(d => `<option value="${d}" ${d === state.targetDate ? 'selected' : ''}>仅看：${d}</option>`).join('')}
+            </select>
+          ` : ''}
           <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
             <input type="checkbox" id="p-hide-done" ${state.hideChecked ? 'checked' : ''} /> 隐藏已核对单据
           </label>
@@ -188,6 +243,14 @@
       e.target.value = '';
     };
 
+    const selDate = root.querySelector('#p-date-sel');
+    if (selDate) {
+      selDate.onchange = e => {
+        state.targetDate = e.target.value;
+        persistState();
+        renderModule(root);
+      };
+    }
     root.querySelector('#p-hide-done').onchange = e => {
       state.hideChecked = e.target.checked;
       renderModule(root);

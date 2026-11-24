@@ -334,15 +334,19 @@
       const codeRaw = iCode >= 0 ? U.formatCode(r[iCode]) : '';
       const name = iName >= 0 ? U.cleanStr(r[iName]) : '';
       const firstCell = U.cleanStr(r[0]);
-      const isNonDataRow = !codeRaw && (
+      const lineJoined = r.map(v => U.cleanStr(v)).join(' ');
+      const isRepeatedHeader = (lineJoined.includes('编码') && lineJoined.includes('名称')) || /^序号/i.test(firstCell);
+      const isBannerOrSign = /^(箱件清单|附清单|开单员|领料人|领料单位|仓管员|仓储主管|编号)/.test(firstCell) ||
+        /^(箱件清单|附清单|开单员|领料人|领料单位|仓管员|仓储主管)/.test(name);
+      const isNonDataRow = isRepeatedHeader || isBannerOrSign || (!codeRaw && (
         !name ||
         /^(空白|合计|总计|小计|制单|审核|审批|主管|领料人)/.test(name) ||
         /^(空白|合计|总计|小计|制单|审核|审批|主管|领料人)/.test(firstCell)
-      );
+      ));
 
-      // 保持编码列文本格式与前导 0
+      // 保持编码列文本格式与前导 0（排除表头文字行）
       const outCodeCol = insertedInAcc && iCode >= iInAcc ? iCode + 1 : iCode;
-      if (outCodeCol >= 0 && codeRaw) rowCopy[outCodeCol] = codeRaw;
+      if (!isNonDataRow && outCodeCol >= 0 && codeRaw) rowCopy[outCodeCol] = codeRaw;
 
       if (isNonDataRow) {
         // 空白/表尾行原样保留，不修改是否在账与备注
