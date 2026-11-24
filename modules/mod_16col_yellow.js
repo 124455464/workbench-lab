@@ -82,12 +82,22 @@
     const aoa = parsed.sheets[sheetName] || [];
     if (aoa.length < 2) throw new Error('表格无有效数据行');
 
-    const rawHeaders = aoa[0].map(h => U.cleanStr(h));
-    let dataRows = aoa.slice(1);
-    // 剔除末尾合计行
+    let hdrIdx = 0;
+    for (let i = 0; i < Math.min(10, aoa.length); i++) {
+      const rowStr = aoa[i].map(c => U.cleanStr(c)).join(' ');
+      if ((rowStr.includes('单据号') || rowStr.includes('出库单号')) && (rowStr.includes('物料编码') || rowStr.includes('存货编码') || rowStr.includes('仓库'))) {
+        hdrIdx = i;
+        break;
+      }
+    }
+
+    const rawHeaders = aoa[hdrIdx].map(h => U.cleanStr(h));
+    let dataRows = aoa.slice(hdrIdx + 1);
+    // 剔除末尾合计行与纯空行
     while (dataRows.length > 0) {
-      const firstCell = U.cleanStr(dataRows[dataRows.length - 1][0]);
-      if (firstCell === '合计' || firstCell === '总计' || dataRows[dataRows.length - 1].every(v => !U.cleanStr(v))) {
+      const lastRow = dataRows[dataRows.length - 1];
+      const firstCell = U.cleanStr(lastRow[0]);
+      if (firstCell === '合计' || firstCell === '总计' || lastRow.every(v => !U.cleanStr(v))) {
         dataRows.pop();
       } else {
         break;

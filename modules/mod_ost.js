@@ -15,6 +15,9 @@
     stockMap: new Map(), // code -> [{ name, spec, wh, loc, qty }]
     stockCount: 0,
     // OST 每日物资筛选态
+    dailySheets: {},     // { sheetName: { headers, rows, availDates } }
+    dailySheetNames: [],
+    dailyActiveSheet: '',
     dailyRawHeaders: [],
     dailyRawRows: [],
     dailyFilteredHeaders: [],
@@ -33,6 +36,9 @@
       subTab: state.subTab,
       stockEntries: Array.from(state.stockMap.entries()),
       stockCount: state.stockCount,
+      dailySheets: state.dailySheets,
+      dailySheetNames: state.dailySheetNames,
+      dailyActiveSheet: state.dailyActiveSheet,
       dailyRawHeaders: state.dailyRawHeaders,
       dailyRawRows: state.dailyRawRows,
       dailyTargetDate: state.dailyTargetDate,
@@ -48,6 +54,9 @@
       state.subTab = saved.subTab || 'daily';
       state.stockMap = new Map(saved.stockEntries || []);
       state.stockCount = saved.stockCount || 0;
+      state.dailySheets = saved.dailySheets || {};
+      state.dailySheetNames = saved.dailySheetNames || [];
+      state.dailyActiveSheet = saved.dailyActiveSheet || state.dailySheetNames[state.dailySheetNames.length - 1] || '';
       state.dailyRawHeaders = saved.dailyRawHeaders || [];
       state.dailyRawRows = saved.dailyRawRows || [];
       state.dailyTargetDate = saved.dailyTargetDate || '';
@@ -56,6 +65,18 @@
       state.auditRows = saved.auditRows || [];
       if (state.dailyRawRows.length) rebuildDailyOutput();
     }
+  }
+
+  function findExactOrMatch(headers, exactList, includeList, excludeRe) {
+    for (const ex of exactList) {
+      const idx = headers.findIndex(h => h === ex);
+      if (idx >= 0) return idx;
+    }
+    for (const inc of includeList) {
+      const idx = headers.findIndex(h => h.includes(inc) && (!excludeRe || !excludeRe.test(h)));
+      if (idx >= 0) return idx;
+    }
+    return -1;
   }
 
   async function loadStockFile(file) {
@@ -68,16 +89,17 @@
       if (aoa.length < 2) return;
       let hdrIdx = 0;
       for (let i = 0; i < Math.min(8, aoa.length); i++) {
-        if (aoa[i].join(' ').includes('编码')) { hdrIdx = i; break; }
+        const line = aoa[i].map(v => U.cleanStr(v)).join(' ');
+        if (/存货编码|物资编码|物料编码/.test(line)) { hdrIdx = i; break; }
       }
       const h = aoa[hdrIdx].map(v => U.cleanStr(v));
-      const iCode = h.findIndex(x => /存货编码|物资编码|物料编码/.test(x));
+      const iCode = findExactOrMatch(h, ['存货编码', '物料编码', '物资编码'], ['存货编码', '物料编码', '物资编码']);
       if (iCode < 0) return;
-      const iName = h.findIndex(x => /名称/.test(x));
-      const iSpec = h.findIndex(x => /规格/.test(x));
-      const iWh = h.findIndex(x => /仓库/.test(x));
-      const iLoc = h.findIndex(x => /货位|库位/.test(x));
-      const iQty = h.findIndex(x => /现存|可用|结存/.test(x));
+      const iName = findExactOrMatch(h, ['存货名称', '物料名称', '物资名称'], ['存货名', '物料名', '物资名', '名称'], /仓库|分类|货位|库位|组织|部门/);
+      const iSpec = findExactOrMatch(h, ['规格型号', '规格'], ['规格']);
+      const iWh = findExactOrMatch(h, ['仓库名称', '仓库'], ['仓库'], /编码|代码/);
+      const iLoc = findExactOrMatch(h, ['货位编码', '库位编码', '货位'], ['货位', '库位'], /名称/);
+      const iQty = findExactOrMatch(h, ['现存数量', '现存量', '可用数量', '结存主数量', '结存数量'], ['现存', '可用', '结存']);
 
       for (let i = hdrIdx + 1; i < aoa.length; i++) {
         const r = aoa[i];
@@ -104,37 +126,72 @@
     U.toast(`现存量索引构建完成：${count} 条记录（${map.size} 个唯一编码，兼容 HTML 伪装 .xls）`, 'success');
   }
 
-  async function loadDailyFile(file) {
-    const parsed = await U.readSpreadsheet(file);
-    const aoa = parsed.sheets[parsed.sheetNames[0]] || [];
-    if (aoa.length < 2) throw new Error('OST 申报表无有效数据');
-
-    let hdrIdx = 0;
-    for (let i = 0; i < Math.min(8, aoa.length); i++) {
-      const txt = aoa[i].join(' ');
-      if (/编码|物料|物资|名称/.test(txt)) { hdrIdx = i; break; }
-    }
-    const headers = aoa[hdrIdx].map(v => U.cleanStr(v));
-    const rows = aoa.slice(hdrIdx + 1).filter(r => r.some(v => U.cleanStr(v) !== ''));
-
-    // 自动探测表格内包含的自然日列表（严禁用系统时间猜日期）
-    const iDate = headers.findIndex(h => h.includes('日期'));
-    const dates = new Set();
-    if (iDate >= 0) {
-      rows.forEach(r => {
-        const d = U.formatDate(r[iDate]);
-        if (/^\d{4}-\d{2}-\d{2}$/.test(d)) dates.add(d);
-      });
-    }
-    state.dailyRawHeaders = headers;
-    state.dailyRawRows = rows;
-    state.dailyAvailDates = Array.from(dates).sort().reverse();
-    state.dailyTargetDate = ''; // 默认显示全部，用户可按表内实际日期下拉筛选
-    state.dailyFileName = file.name;
+  function activateDailySheet(sn) {
+    const sh = state.dailySheets[sn];
+    if (!sh) return;
+    state.dailyActiveSheet = sn;
+    state.dailyRawHeaders = sh.headers;
+    state.dailyRawRows = sh.rows;
+    state.dailyAvailDates = sh.availDates;
+    state.dailyTargetDate = '';
     state.dailyPage = 1;
     rebuildDailyOutput();
+  }
+
+  async function loadDailyFile(file) {
+    const parsed = await U.readSpreadsheet(file);
+    const sheets = {};
+    const validNames = [];
+
+    parsed.sheetNames.forEach(sn => {
+      const aoa = parsed.sheets[sn] || [];
+      if (aoa.length < 2) return;
+      let hdrIdx = -1;
+      for (let i = 0; i < Math.min(8, aoa.length); i++) {
+        const txt = aoa[i].map(v => U.cleanStr(v)).join(' ');
+        if (/编码|物料|物资|存货名称/.test(txt) && /名称|数量|日期/.test(txt)) { hdrIdx = i; break; }
+      }
+      if (hdrIdx < 0) return;
+
+      // 裁掉尾部全空列，避免出现多余空表头
+      const rawH = aoa[hdrIdx].map(v => U.cleanStr(v));
+      let lastNonEmptyCol = rawH.length - 1;
+      while (lastNonEmptyCol >= 0 && !rawH[lastNonEmptyCol]) lastNonEmptyCol--;
+      const headers = rawH.slice(0, lastNonEmptyCol + 1);
+      const rows = aoa.slice(hdrIdx + 1)
+        .filter(r => r.some(v => U.cleanStr(v) !== ''))
+        .map(r => r.slice(0, headers.length));
+
+      const iDate = headers.findIndex(h => h.includes('日期'));
+      const dates = new Set();
+      if (iDate >= 0) {
+        rows.forEach(r => {
+          const d = U.formatDate(r[iDate]);
+          if (/^\d{4}-\d{2}-\d{2}$/.test(d)) dates.add(d);
+        });
+      }
+      validNames.push(sn);
+      sheets[sn] = { headers, rows, availDates: Array.from(dates).sort().reverse() };
+    });
+
+    if (!validNames.length) throw new Error('OST 申报表无有效数据工作表');
+
+    // 多月份分表（如 26.01 ~ 26.11）：默认优先定位到最后一个有效表（最新月份）
+    let defaultSn = validNames[validNames.length - 1];
+    const mFile = file.name.match(/(\d{2,4})[.\-_](\d{1,2})[.\-_](\d{1,2})/);
+    if (mFile) {
+      const yy = mFile[1].slice(-2);
+      const mm = mFile[2].padStart(2, '0');
+      const matched = validNames.find(n => n.includes(`${yy}.${mm}`) || n.includes(`${yy}-${mm}`));
+      if (matched) defaultSn = matched;
+    }
+
+    state.dailySheets = sheets;
+    state.dailySheetNames = validNames;
+    state.dailyFileName = file.name;
+    activateDailySheet(defaultSn);
     persistState();
-    U.toast(`OST 申报表载入成功：共 ${rows.length} 行（已自动追加 3 列并按综合仓置顶/P系沉底排序）`, 'success');
+    U.toast(`OST 申报表载入成功：已定位最新表 [${defaultSn}]（${state.dailyRawRows.length} 行，共 ${validNames.length} 个工作表）`, 'success');
   }
 
   function rebuildDailyOutput() {
@@ -159,6 +216,10 @@
         if (!d.includes(target)) continue;
       }
       const row = baseH.map((_, idx) => (idx < rawRow.length ? U.cleanStr(rawRow[idx]) : ''));
+      if (iDate >= 0 && row[iDate]) {
+        const normD = U.formatDate(row[iDate]);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(normD)) row[iDate] = normD;
+      }
       if (iCode >= 0) {
         const code = U.formatCode(row[iCode]);
         row[iCode] = code;
@@ -269,6 +330,11 @@
           <div class="toolbar">
             <button class="btn btn-primary" id="o-up-daily">📂 导入 OST 申报单 (.xlsx)</button>
             <input type="file" id="o-in-daily" accept=".xls,.xlsx,.csv" class="hidden-input" />
+            ${state.dailySheetNames.length > 1 ? `
+              <select id="o-daily-sheet" title="切换工作表/月份">
+                ${state.dailySheetNames.map(sn => `<option value="${U.escHtml(sn)}" ${sn === state.dailyActiveSheet ? 'selected' : ''}>工作表：${U.escHtml(sn)}</option>`).join('')}
+              </select>
+            ` : ''}
             <select id="o-daily-date">
               <option value="">全部自然日 (${state.dailyRawRows.length} 行)</option>
               ${state.dailyAvailDates.map(d => `<option value="${d}" ${d === state.dailyTargetDate ? 'selected' : ''}>仅筛选：${d}</option>`).join('')}
@@ -321,6 +387,14 @@
         }
         e.target.value = '';
       };
+      const selSheet = root.querySelector('#o-daily-sheet');
+      if (selSheet) {
+        selSheet.onchange = e => {
+          activateDailySheet(e.target.value);
+          persistState();
+          renderModule(root);
+        };
+      }
       root.querySelector('#o-daily-date').onchange = e => {
         state.dailyTargetDate = e.target.value;
         state.dailyPage = 1;
