@@ -26,7 +26,14 @@
     dailyAvailDates: [],
     dailyFileName: '',
     dailyPage: 1,
-    // OST P9 核对态
+    // OST P9 核对态（含箱件清单原表回填 + 10列现存量核对双视图）
+    p9ViewMode: 'backfill', // 'backfill' | 'audit'
+    p9FileName: '',
+    p9SheetName: '',
+    p9BackfillHeaders: [],
+    p9BackfillRows: [],
+    p9InAccCol: -1,
+    p9Stats: { total: 0, hasAcc: 0, manual: 0, skipped: 0 },
     auditRows: [],
     p9Page: 1
   };
@@ -44,6 +51,13 @@
       dailyTargetDate: state.dailyTargetDate,
       dailyAvailDates: state.dailyAvailDates,
       dailyFileName: state.dailyFileName,
+      p9ViewMode: state.p9ViewMode,
+      p9FileName: state.p9FileName,
+      p9SheetName: state.p9SheetName,
+      p9BackfillHeaders: state.p9BackfillHeaders,
+      p9BackfillRows: state.p9BackfillRows,
+      p9InAccCol: state.p9InAccCol,
+      p9Stats: state.p9Stats,
       auditRows: state.auditRows
     });
   }
@@ -62,6 +76,13 @@
       state.dailyTargetDate = saved.dailyTargetDate || '';
       state.dailyAvailDates = saved.dailyAvailDates || [];
       state.dailyFileName = saved.dailyFileName || '';
+      state.p9ViewMode = saved.p9ViewMode || 'backfill';
+      state.p9FileName = saved.p9FileName || '';
+      state.p9SheetName = saved.p9SheetName || '';
+      state.p9BackfillHeaders = saved.p9BackfillHeaders || [];
+      state.p9BackfillRows = saved.p9BackfillRows || [];
+      state.p9InAccCol = typeof saved.p9InAccCol === 'number' ? saved.p9InAccCol : -1;
+      state.p9Stats = saved.p9Stats || { total: 0, hasAcc: 0, manual: 0, skipped: 0 };
       state.auditRows = saved.auditRows || [];
       if (state.dailyRawRows.length) rebuildDailyOutput();
     }
@@ -255,53 +276,136 @@
       return;
     }
     const parsed = await U.readSpreadsheet(file);
-    const sn = parsed.sheetNames.includes('横版') ? '横版' : parsed.sheetNames[0];
+    const sn = parsed.sheetNames.includes('横版')
+      ? '横版'
+      : (parsed.sheetNames.find(n => /箱件|清单|P9/i.test(n)) || parsed.sheetNames[0]);
     const aoa = parsed.sheets[sn] || [];
     let hdrIdx = 0;
     for (let i = 0; i < Math.min(35, aoa.length); i++) {
-      const txt = aoa[i].join(' ');
+      const txt = aoa[i].map(v => U.cleanStr(v)).join(' ');
       if (txt.includes('编码') && txt.includes('名称')) { hdrIdx = i; break; }
     }
-    const h = aoa[hdrIdx].map(v => U.cleanStr(v));
-    const iCode = h.findIndex(x => x.includes('编码'));
-    const iName = h.findIndex(x => x.includes('名称'));
-    const iSpec = h.findIndex(x => x.includes('规格'));
-    const iUnit = h.findIndex(x => x.includes('单位'));
-    const iQty = h.findIndex(x => x.includes('数量'));
 
-    const out = [];
-    for (let i = hdrIdx + 1; i < aoa.length; i++) {
-      const r = aoa[i];
-      const code = iCode >= 0 ? U.formatCode(r[iCode]) : '';
+    // 保留原表完整表头（裁去尾部纯空列）
+    const rawH = (aoa[hdrIdx] || []).map(v => U.cleanStr(v));
+    let lastCol = rawH.length - 1;
+    while (lastCol >= 0 && !rawH[lastCol]) lastCol--;
+    const baseHeaders = rawH.slice(0, lastCol + 1);
+
+    const iCode = baseHeaders.findIndex(x => /编码|kode/i.test(x) && !/货位|用途/.test(x));
+    const iName = baseHeaders.findIndex(x => /名称|material/i.test(x));
+    const iSpec = baseHeaders.findIndex(x => /规格|spesifikasi/i.test(x));
+    const iUnit = baseHeaders.findIndex(x => /单位|unit/i.test(x));
+    const iQty = baseHeaders.findIndex(x => /数量|qty/i.test(x));
+    const iRem = baseHeaders.findIndex(x => /备注|komentar/i.test(x));
+    let iInAcc = baseHeaders.findIndex(x => /是否在账|在账|akun\s*apakah/i.test(x));
+
+    // 若原表暂无「是否在账」列，则在「备注」列前插入（严禁改动备注列）
+    const outHeaders = [...baseHeaders];
+    let insertedInAcc = false;
+    if (iInAcc < 0) {
+      insertedInAcc = true;
+      if (iRem >= 0) {
+        iInAcc = iRem;
+        outHeaders.splice(iInAcc, 0, '是否在账');
+      } else {
+        iInAcc = outHeaders.length;
+        outHeaders.push('是否在账');
+      }
+    }
+
+    const backfillRows = [];
+    const auditOut = [];
+    let hasAccCnt = 0;
+    let manualCnt = 0;
+    let skippedCnt = 0;
+
+    // 保留表头后的全部有效行（原行序 100% 锁定，备注列 100% 不改）
+    let dataSlice = aoa.slice(hdrIdx + 1);
+    while (dataSlice.length > 0 && dataSlice[dataSlice.length - 1].every(v => !U.cleanStr(v))) {
+      dataSlice.pop();
+    }
+
+    for (let idx = 0; idx < dataSlice.length; idx++) {
+      const r = dataSlice[idx];
+      const rowCopy = baseHeaders.map((_, c) => (c < r.length ? U.cleanStr(r[c]) : ''));
+      if (insertedInAcc) rowCopy.splice(iInAcc, 0, '');
+
+      const codeRaw = iCode >= 0 ? U.formatCode(r[iCode]) : '';
       const name = iName >= 0 ? U.cleanStr(r[iName]) : '';
-      if (!code && !name) continue;
-      if (/^(合计|总计|小计|制单|审核|审批|主管|领料人)/.test(code || name)) continue;
+      const firstCell = U.cleanStr(r[0]);
+      const isNonDataRow = !codeRaw && (
+        !name ||
+        /^(空白|合计|总计|小计|制单|审核|审批|主管|领料人)/.test(name) ||
+        /^(空白|合计|总计|小计|制单|审核|审批|主管|领料人)/.test(firstCell)
+      );
+
+      // 保持编码列文本格式与前导 0
+      const outCodeCol = insertedInAcc && iCode >= iInAcc ? iCode + 1 : iCode;
+      if (outCodeCol >= 0 && codeRaw) rowCopy[outCodeCol] = codeRaw;
+
+      if (isNonDataRow) {
+        // 空白/表尾行原样保留，不修改是否在账与备注
+        backfillRows.push(rowCopy);
+        continue;
+      }
+
       const reqQty = iQty >= 0 ? U.parseNum(r[iQty]) : 0;
-      const matches = state.stockMap.get(code) || [];
+
+      if (!codeRaw) {
+        // 铁律：没有写编码就跳过处理（是否在账不填，备注不改）
+        skippedCnt++;
+        backfillRows.push(rowCopy);
+        auditOut.push([
+          hdrIdx + 2 + idx, '', name,
+          iSpec >= 0 ? U.cleanStr(r[iSpec]) : '',
+          iUnit >= 0 ? U.cleanStr(r[iUnit]) : '',
+          reqQty, '', '', '', '⏭️ 无编码跳过'
+        ]);
+        continue;
+      }
+
+      const matches = state.stockMap.get(codeRaw) || [];
       const totalStock = matches.reduce((s, m) => s + m.qty, 0);
       const p9Locs = matches.filter(m => m.wh.includes('P9') || m.loc.includes('2105')).map(m => `${m.loc}(${U.fmtNum(m.qty)})`).join('; ');
       const allLocs = matches.map(m => `${m.wh}:${m.loc || '无货位'}(${U.fmtNum(m.qty)})`).join(' | ');
-      let status = '✅ 充足';
-      if (matches.length === 0) status = '❌ 无库存记录';
-      else if (totalStock < reqQty) status = `⚠️ 库存不足(缺${U.fmtNum(reqQty - totalStock)})`;
 
-      out.push([
-        i + 1, code, name,
+      // 铁律：有对应编码就写「有」，无就写「未入库开手工单」，备注严禁改动
+      if (matches.length > 0) {
+        rowCopy[iInAcc] = '有';
+        hasAccCnt++;
+      } else {
+        rowCopy[iInAcc] = '未入库开手工单';
+        manualCnt++;
+      }
+      backfillRows.push(rowCopy);
+
+      let status = '✅ 有（库存充足）';
+      if (matches.length === 0) status = '❌ 未入库开手工单';
+      else if (totalStock < reqQty) status = `⚠️ 有（库存不足，缺${U.fmtNum(reqQty - totalStock)}）`;
+
+      auditOut.push([
+        hdrIdx + 2 + idx, codeRaw, name,
         iSpec >= 0 ? U.cleanStr(r[iSpec]) : '',
         iUnit >= 0 ? U.cleanStr(r[iUnit]) : '',
         reqQty, U.fmtNum(totalStock), p9Locs, allLocs, status
       ]);
     }
 
-    state.auditRows = out;
+    state.p9FileName = file.name;
+    state.p9SheetName = sn;
+    state.p9BackfillHeaders = outHeaders;
+    state.p9BackfillRows = backfillRows;
+    state.p9InAccCol = iInAcc;
+    state.p9Stats = { total: auditOut.length, hasAcc: hasAccCnt, manual: manualCnt, skipped: skippedCnt };
+    state.auditRows = auditOut;
     state.p9Page = 1;
     persistState();
-    U.toast(`P9 核对完成：共 ${out.length} 行领料明细`, 'success');
+    U.toast(`P9 核对完成：有 ${hasAccCnt} 条 | 未入库开手工单 ${manualCnt} 条 | 无编码跳过 ${skippedCnt} 条（备注零改动）`, 'success');
   }
 
   function renderModule(root) {
-    const okCnt = state.auditRows.filter(r => r[9].startsWith('✅')).length;
-    const errCnt = state.auditRows.length - okCnt;
+    const st = state.p9Stats || { total: 0, hasAcc: 0, manual: 0, skipped: 0 };
 
     root.innerHTML = `
       <div class="panel">
@@ -347,17 +451,24 @@
         </div>
       ` : `
         <div class="panel">
+          <div class="panel-title">
+            <span>🔍 OST P9 箱件清单核对（规则：有编码在账写「有」· 无写「未入库开手工单」· 无编码跳过 · 备注严禁改动）</span>
+            <span class="pill pill-blue">${state.p9FileName || '待导入箱件清单 / P9 领料单'}</span>
+          </div>
           <div class="kpi-grid">
             <div class="kpi-card blue"><div class="kpi-label">现存量记录数</div><div class="kpi-val">${state.stockCount}</div></div>
-            <div class="kpi-card"><div class="kpi-label">P9 核对申领行数</div><div class="kpi-val">${state.auditRows.length}</div></div>
-            <div class="kpi-card green"><div class="kpi-label">库存充足行数</div><div class="kpi-val">${okCnt}</div></div>
-            <div class="kpi-card ${errCnt ? 'red' : 'green'}"><div class="kpi-label">无库存 / 不足行数</div><div class="kpi-val">${errCnt}</div></div>
+            <div class="kpi-card green"><div class="kpi-label">在账（写「有」）</div><div class="kpi-val">${st.hasAcc}</div></div>
+            <div class="kpi-card ${st.manual ? 'red' : 'green'}"><div class="kpi-label">未入库开手工单</div><div class="kpi-val">${st.manual}</div></div>
+            <div class="kpi-card orange"><div class="kpi-label">无编码（已跳过）</div><div class="kpi-val">${st.skipped}</div></div>
           </div>
           <div class="toolbar">
-            <button class="btn btn-warning" id="o-up-req">📋 导入 P9 领料单（横版）</button>
+            <button class="btn btn-warning" id="o-up-req">📋 导入 P9 箱件清单 / 领料单</button>
             <input type="file" id="o-in-req" accept=".xls,.xlsx" class="hidden-input" />
+            <button class="btn ${state.p9ViewMode === 'backfill' ? 'btn-primary' : ''}" id="o-p9-v-backfill">📄 原表回填视图（含备注）</button>
+            <button class="btn ${state.p9ViewMode === 'audit' ? 'btn-primary' : ''}" id="o-p9-v-audit">🔍 10列现存量详单</button>
             <span style="flex:1"></span>
-            <button class="btn btn-success" id="o-exp" ${!state.auditRows.length ? 'disabled' : ''}>💾 导出现存量核对表 (.xlsx)</button>
+            <button class="btn" id="o-p9-copy-col" ${!state.p9BackfillRows.length ? 'disabled' : ''} title="仅复制「是否在账」单列，按原行序 1:1 直接贴回原 Excel，0 破坏原表格式与备注">📋 仅复制「是否在账」列</button>
+            <button class="btn btn-success" id="o-exp" ${!state.p9BackfillRows.length && !state.auditRows.length ? 'disabled' : ''}>💾 导出回填+核对双表 (.xlsx)</button>
           </div>
           <div id="o-p9-table"></div>
         </div>
@@ -440,18 +551,62 @@
         }
         e.target.value = '';
       };
-      root.querySelector('#o-exp').onclick = () => {
-        U.exportWorkbook([{ name: '现存量核对', headers: AUDIT_HEADERS, rows: state.auditRows, textCols: [1], numCols: [5, 6] }], 'OST_P9_现存量核对结果.xlsx');
-        U.toast('已导出 OST_P9_现存量核对结果.xlsx', 'success');
+      root.querySelector('#o-p9-v-backfill').onclick = () => { state.p9ViewMode = 'backfill'; state.p9Page = 1; renderModule(root); };
+      root.querySelector('#o-p9-v-audit').onclick = () => { state.p9ViewMode = 'audit'; state.p9Page = 1; renderModule(root); };
+      root.querySelector('#o-p9-copy-col').onclick = async () => {
+        const colIdx = state.p9InAccCol;
+        if (colIdx < 0 || !state.p9BackfillRows.length) return;
+        const lines = state.p9BackfillRows.map(r => String(r[colIdx] ?? '').replace(/[\t\r\n]+/g, ' '));
+        await U.copyText(lines.join('\n'));
+        U.toast(`已复制「是否在账」列（共 ${lines.length} 行，1:1 对齐原表行序，可直接粘贴回原表格）`, 'success');
       };
-      U.renderPagedTable(root.querySelector('#o-p9-table'), {
-        headers: AUDIT_HEADERS,
-        rows: state.auditRows,
-        page: state.p9Page,
-        pageSize: 100,
-        rowClassFn: r => r[9].startsWith('❌') ? 'row-err' : (r[9].startsWith('⚠️') ? 'row-warn' : 'row-ok'),
-        onPageChange: pg => { state.p9Page = pg; renderModule(root); }
-      });
+      root.querySelector('#o-exp').onclick = () => {
+        const sheets = [];
+        if (state.p9BackfillHeaders.length && state.p9BackfillRows.length) {
+          const iCode = state.p9BackfillHeaders.findIndex(x => /编码|kode/i.test(x) && !/货位|用途/.test(x));
+          sheets.push({
+            name: state.p9SheetName || '箱件清单',
+            headers: state.p9BackfillHeaders,
+            rows: state.p9BackfillRows,
+            textCols: iCode >= 0 ? [iCode] : []
+          });
+        }
+        sheets.push({
+          name: '现存量核对',
+          headers: AUDIT_HEADERS,
+          rows: state.auditRows,
+          textCols: [1],
+          numCols: [5, 6]
+        });
+        U.exportWorkbook(sheets, 'OST_P9_箱件清单核对结果.xlsx');
+        U.toast('已导出 OST_P9_箱件清单核对结果.xlsx（含原表回填 + 现存量核对双表）', 'success');
+      };
+
+      if (state.p9ViewMode === 'backfill' && state.p9BackfillHeaders.length) {
+        const colIdx = state.p9InAccCol;
+        U.renderPagedTable(root.querySelector('#o-p9-table'), {
+          headers: state.p9BackfillHeaders,
+          rows: state.p9BackfillRows,
+          page: state.p9Page,
+          pageSize: 100,
+          rowClassFn: r => {
+            const v = colIdx >= 0 ? (r[colIdx] || '') : '';
+            if (v === '有') return 'row-ok';
+            if (v === '未入库开手工单') return 'row-err';
+            return '';
+          },
+          onPageChange: pg => { state.p9Page = pg; renderModule(root); }
+        });
+      } else {
+        U.renderPagedTable(root.querySelector('#o-p9-table'), {
+          headers: AUDIT_HEADERS,
+          rows: state.auditRows,
+          page: state.p9Page,
+          pageSize: 100,
+          rowClassFn: r => r[9].startsWith('❌') ? 'row-err' : (r[9].startsWith('⚠️') ? 'row-warn' : (r[9].startsWith('✅') ? 'row-ok' : '')),
+          onPageChange: pg => { state.p9Page = pg; renderModule(root); }
+        });
+      }
     }
   }
 
@@ -468,7 +623,7 @@
     async handleIncomingFiles(files) {
       for (const f of files) {
         if (/现存量/i.test(f.name)) await loadStockFile(f);
-        else if (/P9|横版/i.test(f.name)) { state.subTab = 'p9'; await auditRequisitionFile(f); }
+        else if (/P9|横版|箱件|清单/i.test(f.name)) { state.subTab = 'p9'; await auditRequisitionFile(f); }
         else { state.subTab = 'daily'; await loadDailyFile(f); }
       }
       if (this._root) renderModule(this._root);
