@@ -12,7 +12,7 @@
     '是否配送', '黄单是否回收', '欠请购单', '货位编码'
   ];
   const COL_WIDTHS = [24, 22, 12, 10, 26, 18, 14, 22, 8, 12, 26, 32, 10, 14, 12, 18];
-  const QUICK_REASONS = ['车间未签回', '今日未送达', '补交中', '现场自取未标', '黄单遗失待补'];
+  const QUICK_REASONS = ['物资已领取', '自取延迟', '配送延迟', '开单延迟'];
   const DOC_REGEX = /(?:CCHF|CK)\d{10,22}/gi;
 
   let activeRoot = null;
@@ -345,7 +345,30 @@
     })();
   }
 
+  /** 统计未回收配送单据，并交叉核对「同一天 + 同一车间」其他仓库是否已回收 */
   function getUnrecoveredGroups() {
+    // 1. 先按「日期||车间」统计每个仓库的回收情况
+    const dayDeptWh = new Map(); // "date||dept" -> Map(wh -> { hasRec, hasUnrec })
+    state.rows.forEach(row => {
+      const date = U.cleanStr(row[2]);
+      const dept = U.cleanStr(row[5]) || '未知车间';
+      const wh = U.cleanStr(row[3]) || '未知仓';
+      const doc = U.cleanStr(row[1]).toUpperCase();
+      if (!doc) return;
+      const isDeliv = U.cleanStr(row[12]) === '是';
+      const isRec = state.recoveredSet.has(doc) || U.cleanStr(row[13]) === '是';
+      if (!isDeliv && !isRec) return;
+
+      const ddKey = `${date}||${dept}`;
+      if (!dayDeptWh.has(ddKey)) dayDeptWh.set(ddKey, new Map());
+      const whMap = dayDeptWh.get(ddKey);
+      if (!whMap.has(wh)) whMap.set(wh, { hasRec: false, hasUnrec: false });
+      const st = whMap.get(wh);
+      if (isRec) st.hasRec = true;
+      else if (isDeliv) st.hasUnrec = true;
+    });
+
+    // 2. 按未回收单据号聚合
     const map = new Map();
     state.rows.forEach((row, idx) => {
       const doc = U.cleanStr(row[1]).toUpperCase();
@@ -355,18 +378,47 @@
       if (!map.has(doc)) {
         map.set(doc, {
           doc,
-          dept: row[5],
-          wh: row[3],
-          date: row[2],
+          shortDoc: doc.length > 8 ? `…${doc.slice(-6)}` : doc,
+          dept: U.cleanStr(row[5]) || '未知车间',
+          wh: U.cleanStr(row[3]) || '未知仓',
+          date: U.cleanStr(row[2]),
           rowIndices: [],
           samples: []
         });
       }
       const g = map.get(doc);
       g.rowIndices.push(idx + 1);
-      if (g.samples.length < 3) g.samples.push(`${row[7]}(${row[9]}${row[8]})`);
+      if (g.samples.length < 4) g.samples.push(`${row[7]}(${row[9]}${row[8]})`);
     });
-    return Array.from(map.values());
+
+    // 3. 附加上同日同车间各仓库的交叉核对结论
+    const list = Array.from(map.values());
+    list.forEach(g => {
+      const whMap = dayDeptWh.get(`${g.date}||${g.dept}`) || new Map();
+      const recWhs = [];
+      const unrecWhs = [];
+      for (const [wh, st] of whMap.entries()) {
+        if (st.hasUnrec) unrecWhs.push(wh);
+        else if (st.hasRec) recWhs.push(wh);
+      }
+      const otherRecWhs = recWhs.filter(w => w !== g.wh);
+      const otherUnrecWhs = unrecWhs.filter(w => w !== g.wh);
+
+      if (otherRecWhs.length > 0 && otherUnrecWhs.length === 0) {
+        g.whHint = `${otherRecWhs.join('、')}已回收（仅本仓未回收）`;
+        g.whTone = 'pill-green';
+      } else if (otherRecWhs.length > 0 && otherUnrecWhs.length > 0) {
+        g.whHint = `${otherRecWhs.join('、')}已回收；本仓及${otherUnrecWhs.join('、')}未回收`;
+        g.whTone = 'pill-orange';
+      } else if (otherUnrecWhs.length > 0) {
+        g.whHint = `当日该车间全部仓库均未回收（${unrecWhs.join('、')}）`;
+        g.whTone = 'pill-red';
+      } else {
+        g.whHint = `当日该车间仅此仓（未回收）`;
+        g.whTone = 'pill-red';
+      }
+    });
+    return list;
   }
 
   function renderModule(root) {
@@ -421,8 +473,13 @@
               : `第 ${g.rowIndices[0]}~${g.rowIndices[g.rowIndices.length - 1]} 行（共 ${g.rowIndices.length} 行）`;
             return `<div class="unrec-item" data-doc="${g.doc}">
               <div class="unrec-meta">
-                <div><b>${idx + 1}. ${g.doc}</b> <span class="pill pill-blue">${U.escHtml(g.dept || '未知部门')}</span> <span style="color:#64748b;font-size:11.5px;">${g.date || ''} · ${rowSpan}</span></div>
-                <div style="font-size:11.5px;color:#475569;">物资摘要：${U.escHtml(g.samples.join('、'))}${g.rowIndices.length > 3 ? ' ...' : ''}</div>
+                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                  <b style="font-size:13.5px;color:#0f172a;">${idx + 1}. ${U.escHtml(g.dept)}</b>
+                  <span class="pill pill-blue">${U.escHtml(g.wh)}</span>
+                  <span class="pill ${g.whTone}">${U.escHtml(g.whHint)}</span>
+                  <span style="color:#64748b;font-size:11.5px;" title="完整单据号：${g.doc}">${g.date || ''} · 单号${g.shortDoc} · ${rowSpan}</span>
+                </div>
+                <div style="font-size:12.5px;color:#1e293b;font-weight:600;margin-top:3px;">物品：${U.escHtml(g.samples.join('、'))}${g.rowIndices.length > 4 ? ' ...' : ''}</div>
               </div>
               <div class="unrec-actions">
                 ${QUICK_REASONS.map(r => `<button class="chip-btn" data-doc="${g.doc}" data-reason="${r}">${r}</button>`).join('')}
