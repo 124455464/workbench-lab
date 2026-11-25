@@ -250,7 +250,7 @@
   <script src="./modules/mod_photo_check.js?v=20261124"></script>
   <script src="./modules/mod_stagnant.js?v=20261124"></script>
   <script src="./modules/mod_ost.js?v=20261124"></script>
-  <script src="./modules/mod_laobao.js?v=20261124"></script>
+  <script src="./modules/mod_laobao.js?v=20261124b"></script>
 
   <script>
     (function () {
@@ -334,7 +334,7 @@
           switchTab('mod_ost', files);
           return;
         }
-        if (/劳保|人员名单|空白表格/i.test(namesJoined)) {
+        if (/劳保|人员名单|ID卡信息|空白表格/i.test(namesJoined)) {
           WB.Utils.toast('智能识别：劳保物资表 -> 跳转【劳保发放统计】', 'success');
           switchTab('mod_laobao', files);
           return;
