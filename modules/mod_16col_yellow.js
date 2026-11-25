@@ -1,6 +1,5 @@
 /**
- * 模块 1：材料出库单 16 列精简 + 手机扫描 PDF 黄单回收 + 未回收原位快填复制动态表格
- * 独立隔离模块：仅负责本业务，出错不影响其他任何模块。
+ * 模块 1：材料出库单 74 列 → 16 列精简与自取物资转换（纯粹转换版，与黄单回收彻底独立）
  */
 (function () {
   'use strict';
@@ -18,31 +17,19 @@
     '柴油', '汽油', '煤油', '机油', '润滑油', '液压油', '齿轮油', '重油', '黄油'
   ];
   const KEEP_TOOL_WORDS = ['表', '管', '阀', '枪'];
-  const QUICK_REASONS = ['车间未签回', '今日未送达', '补交中', '现场自取未标', '黄单遗失待补'];
-  const DOC_REGEX = /(?:CCHF|CK)\d{10,22}/gi;
 
   let state = {
-    subTab: '16col',    // '16col'（纯16列与自取转换）| 'yellow'（次日黄单回收核对）
     mainRows: [],       // 16列完整原表（行顺序100%锁死）
     selfRows: [],       // 自取物资表
-    recoveredSet: new Set(),
-    unrecReasons: {},   // { docNo: reasonText }
     activeView: 'main', // 'main' | 'self'
-    filterMode: 'all',  // 'all' | 'delivery' | 'unrec' | 'rec'
     page: 1,
-    pdfLog: '',
-    sourceName: '',
-    _hydrated: false
+    sourceName: ''
   };
 
   function persistState() {
     WB.Store.save('mod_16col_yellow', {
-      subTab: state.subTab,
       mainRows: state.mainRows,
       selfRows: state.selfRows,
-      recoveredList: Array.from(state.recoveredSet),
-      unrecReasons: state.unrecReasons,
-      pdfLog: state.pdfLog,
       sourceName: state.sourceName
     });
   }
@@ -50,15 +37,10 @@
   async function hydrateState() {
     const saved = await WB.Store.load('mod_16col_yellow');
     if (saved) {
-      state.subTab = saved.subTab || '16col';
       state.mainRows = saved.mainRows || [];
       state.selfRows = saved.selfRows || [];
-      state.recoveredSet = new Set(saved.recoveredList || []);
-      state.unrecReasons = saved.unrecReasons || {};
-      state.pdfLog = saved.pdfLog || '';
       state.sourceName = saved.sourceName || '';
     }
-    state._hydrated = true;
   }
 
   function isExcludedGasOrOil(name) {
@@ -85,6 +67,7 @@
     const aoa = parsed.sheets[sheetName] || [];
     if (aoa.length < 2) throw new Error('表格无有效数据行');
 
+    // 自动扫描前 10 行定位真实表头行（兼容 ERP 首行为“材料出库单列表”合并标题）
     let hdrIdx = 0;
     for (let i = 0; i < Math.min(10, aoa.length); i++) {
       const rowStr = aoa[i].map(c => U.cleanStr(c)).join(' ');
@@ -96,7 +79,6 @@
 
     const rawHeaders = aoa[hdrIdx].map(h => U.cleanStr(h));
     let dataRows = aoa.slice(hdrIdx + 1);
-    // 剔除末尾合计行与纯空行
     while (dataRows.length > 0) {
       const lastRow = dataRows[dataRows.length - 1];
       const firstCell = U.cleanStr(lastRow[0]);
@@ -163,213 +145,47 @@
     state.selfRows = selfRows;
     state.sourceName = file.name;
     state.page = 1;
-    // 若已有已识别的黄单集合，立刻同步回填
-    applyYellowAndReasons();
     persistState();
-    U.toast(`成功解析 ${mainRows.length} 行（与源表 100% 行数一致），自取物资 ${selfRows.length} 行`, 'success');
-  }
-
-  /** 将已回收单号 & 未回收原因严格回填到 N 列（索引 13），原表顺序 100% 不变 */
-  function applyYellowAndReasons() {
-    for (let i = 0; i < state.mainRows.length; i++) {
-      const row = state.mainRows[i];
-      const doc = U.cleanStr(row[1]).toUpperCase();
-      if (!doc) continue;
-      if (state.recoveredSet.has(doc)) {
-        row[13] = '是'; // N 列（第 14 列「黄单是否回收」）
-      } else if (state.unrecReasons[doc] !== undefined) {
-        row[13] = state.unrecReasons[doc];
-      }
-    }
-  }
-
-  /** 从手机扫描 PDF 中提取 CCHF/CK 单号（优先高速文本层，若无文本层则自动切换 OCR 识图） */
-  async function extractDocsFromPdfs(pdfFiles, progressCb) {
-    const found = new Set();
-    let totalPages = 0;
-    let ocrPages = 0;
-
-    for (const file of pdfFiles) {
-      const buf = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-      totalPages += pdf.numPages;
-
-      for (let p = 1; p <= pdf.numPages; p++) {
-        progressCb(`正在扫描 ${file.name} 第 ${p}/${pdf.numPages} 页...`);
-        const page = await pdf.getPage(p);
-        const textContent = await page.getTextContent();
-        const pageText = textContent.items.map(it => it.str).join(' ');
-        const matches = pageText.match(DOC_REGEX) || [];
-        if (matches.length > 0) {
-          matches.forEach(m => found.add(m.toUpperCase()));
-        } else if (window.Tesseract) {
-          // 手机纯图片扫描件：渲染为 Canvas 后用 Tesseract OCR 提取单号
-          ocrPages++;
-          progressCb(`第 ${p}/${pdf.numPages} 页为纯图片扫描件，正在 OCR 提取单号...`);
-          const viewport = page.getViewport({ scale: 1.8 });
-          const canvas = document.createElement('canvas');
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-          const res = await Tesseract.recognize(canvas, 'eng', {
-            tessedit_char_whitelist: 'CCHFK0123456789'
-          });
-          const ocrText = (res.data.text || '').replace(/\s+/g, '');
-          const ocrMatches = ocrText.match(/(?:CCHF|CK)\d{10,22}/gi) || [];
-          ocrMatches.forEach(m => found.add(m.toUpperCase()));
-        }
-      }
-    }
-    return { found, totalPages, ocrPages };
-  }
-
-  /** 获取所有 M列="是" 且尚未回收黄单的去重单据清单（用于上方快填栏） */
-  function getUnrecoveredGroups() {
-    const map = new Map();
-    state.mainRows.forEach((row, idx) => {
-      const doc = U.cleanStr(row[1]).toUpperCase();
-      const isDeliv = U.cleanStr(row[12]) === '是';
-      const isRec = state.recoveredSet.has(doc) || U.cleanStr(row[13]) === '是';
-      if (!doc || !isDeliv || isRec) return;
-      if (!map.has(doc)) {
-        map.set(doc, {
-          doc,
-          dept: row[5],
-          wh: row[3],
-          date: row[2],
-          rowIndices: [],
-          samples: []
-        });
-      }
-      const g = map.get(doc);
-      g.rowIndices.push(idx + 1);
-      if (g.samples.length < 3) g.samples.push(`${row[7]}(${row[9]}${row[8]})`);
-    });
-    return Array.from(map.values());
+    U.toast(`16列转换完成：共 ${mainRows.length} 行（与源表 100% 一致），自取物资 ${selfRows.length} 行`, 'success');
   }
 
   function renderModule(root) {
     const mainRows = state.mainRows;
     const delivRows = mainRows.filter(r => r[12] === '是');
-    const recRows = delivRows.filter(r => r[13] === '是');
-    const unrecGroups = getUnrecoveredGroups();
-    const pendingExplain = unrecGroups.filter(g => !U.cleanStr(state.unrecReasons[g.doc])).length;
-    const isYellowMode = state.subTab === 'yellow';
-
-    let displayRows = state.activeView === 'self' ? state.selfRows : mainRows;
-    if (state.activeView === 'main' && isYellowMode) {
-      if (state.filterMode === 'delivery') displayRows = mainRows.filter(r => r[12] === '是');
-      else if (state.filterMode === 'rec') displayRows = mainRows.filter(r => r[13] === '是');
-      else if (state.filterMode === 'unrec') displayRows = mainRows.filter(r => r[12] === '是' && r[13] !== '是');
-    }
+    const displayRows = state.activeView === 'self' ? state.selfRows : mainRows;
 
     root.innerHTML = `
       <div class="panel">
         <div class="panel-title">
-          <span>📦 材料出库单工作台（16列转换 与 黄单回收 独立分栏）</span>
-          <div style="display:flex;gap:6px;">
-            <button class="btn ${!isYellowMode ? 'btn-primary' : ''}" id="m1-sub-16col">📦 16列精简与自取转换</button>
-            <button class="btn ${isYellowMode ? 'btn-primary' : ''}" id="m1-sub-yellow">📄 黄单回收核对（次日）</button>
-          </div>
+          <span>📦 材料出库单 74 列 → 16 列精简与自取物资转换</span>
+          <span class="pill pill-blue">${state.sourceName ? '当前底表：' + U.escHtml(state.sourceName) : '等待上传 ERP 74 列材料出库单'}</span>
         </div>
-
-        ${!isYellowMode ? `
-          <div class="kpi-grid">
-            <div class="kpi-card blue"><div class="kpi-label">总记录行数（源表100%对齐）</div><div class="kpi-val">${mainRows.length}</div></div>
-            <div class="kpi-card"><div class="kpi-label">需配送行数 (M列=是)</div><div class="kpi-val">${delivRows.length}</div></div>
-            <div class="kpi-card green"><div class="kpi-label">自取物资筛选行数</div><div class="kpi-val">${state.selfRows.length}</div></div>
-          </div>
-          <div class="toolbar">
-            <button class="btn btn-primary" id="btn-up-xlsx">📂 上传 74 列材料出库单 (.xlsx)</button>
-            <input type="file" id="in-up-xlsx" accept=".xlsx,.xls,.csv" class="hidden-input" />
-            <span class="pill pill-blue">${state.sourceName ? '当前底表：' + U.escHtml(state.sourceName) : '等待上传 ERP 74 列材料出库单'}</span>
-            <span style="flex:1"></span>
-            <button class="btn btn-success" id="btn-copy-tsv" ${!mainRows.length ? 'disabled' : ''}>📋 一键复制当前表（原顺序）</button>
-            <button class="btn" id="btn-exp-xlsx" ${!mainRows.length ? 'disabled' : ''}>💾 导出 16 列双表 (.xlsx)</button>
-          </div>
-        ` : `
-          <div class="kpi-grid">
-            <div class="kpi-card blue"><div class="kpi-label">台账总行数</div><div class="kpi-val">${mainRows.length}</div></div>
-            <div class="kpi-card"><div class="kpi-label">需配送行数 (M列=是)</div><div class="kpi-val">${delivRows.length}</div></div>
-            <div class="kpi-card green"><div class="kpi-label">黄单已回收行数 (N列=是)</div><div class="kpi-val">${recRows.length}</div></div>
-            <div class="kpi-card ${unrecGroups.length ? 'orange' : 'green'}"><div class="kpi-label">未回收配送单据数 (待说明: ${pendingExplain})</div><div class="kpi-val">${unrecGroups.length}</div></div>
-          </div>
-          <div class="toolbar">
-            <button class="btn" id="btn-up-xlsx">📂 1. 上传/更换 16 列台账 (.xlsx)</button>
-            <input type="file" id="in-up-xlsx" accept=".xlsx,.xls,.csv" class="hidden-input" />
-            <button class="btn btn-warning" id="btn-up-pdf">📄 2. 导入手机扫描黄单 PDF</button>
-            <input type="file" id="in-up-pdf" accept=".pdf" multiple class="hidden-input" />
-            <button class="btn" id="btn-paste-docs">📋 手动粘贴已回收单号</button>
-            <span style="flex:1"></span>
-            <button class="btn btn-success" id="btn-copy-tsv" ${!mainRows.length ? 'disabled' : ''}>📋 一键复制回填后全表</button>
-            <button class="btn" id="btn-exp-xlsx" ${!mainRows.length ? 'disabled' : ''}>💾 导出黄单核对版 (.xlsx)</button>
-          </div>
-          <div id="pdf-status" style="font-size:12px;color:#0369a1;margin-bottom:4px;">${U.escHtml(state.pdfLog)}</div>
-        `}
+        <div class="kpi-grid">
+          <div class="kpi-card blue"><div class="kpi-label">总记录行数（源表100%对齐）</div><div class="kpi-val">${mainRows.length}</div></div>
+          <div class="kpi-card"><div class="kpi-label">需配送行数 (M列=是)</div><div class="kpi-val">${delivRows.length}</div></div>
+          <div class="kpi-card green"><div class="kpi-label">自取物资筛选行数</div><div class="kpi-val">${state.selfRows.length}</div></div>
+        </div>
+        <div class="toolbar">
+          <button class="btn btn-primary" id="btn-up-xlsx">📂 上传 74 列材料出库单 (.xlsx)</button>
+          <input type="file" id="in-up-xlsx" accept=".xlsx,.xls,.csv" class="hidden-input" />
+          <span style="flex:1"></span>
+          <button class="btn btn-success" id="btn-copy-tsv" ${!mainRows.length ? 'disabled' : ''}>📋 一键复制当前表（无表头原序，直接贴入总表）</button>
+          <button class="btn" id="btn-exp-xlsx" ${!mainRows.length ? 'disabled' : ''}>💾 导出 16 列双表 (.xlsx)</button>
+        </div>
       </div>
-
-      ${isYellowMode && unrecGroups.length > 0 ? `
-      <div class="unrec-box">
-        <div class="panel-title" style="margin-bottom:4px;">
-          <span>⚠️ 黄单未回收快填栏：共 <b>${unrecGroups.length}</b> 张配送单尚未回收黄单（在此填一次，下方大表【原位置、原顺序100%不变】自动同步填入 N 列）</span>
-          <span class="pill pill-orange">剩余 ${pendingExplain} 张未填说明</span>
-        </div>
-        <div class="unrec-list">
-          ${unrecGroups.map((g, idx) => {
-            const curVal = state.unrecReasons[g.doc] || '';
-            const rowSpan = g.rowIndices.length === 1
-              ? `原表第 ${g.rowIndices[0]} 行`
-              : `原表第 ${g.rowIndices[0]}~${g.rowIndices[g.rowIndices.length - 1]} 行（共 ${g.rowIndices.length} 行）`;
-            return `<div class="unrec-item" data-doc="${g.doc}">
-              <div class="unrec-meta">
-                <div><b>${idx + 1}. ${g.doc}</b> <span class="pill pill-blue">${U.escHtml(g.dept || '未知部门')}</span> <span style="color:#64748b;font-size:11.5px;">${rowSpan}</span></div>
-                <div style="font-size:11.5px;color:#475569;">物资摘要：${U.escHtml(g.samples.join('、'))}${g.rowIndices.length > 3 ? ' ...' : ''}</div>
-              </div>
-              <div class="unrec-actions">
-                ${QUICK_REASONS.map(r => `<button class="chip-btn" data-doc="${g.doc}" data-reason="${r}">${r}</button>`).join('')}
-                <input type="text" class="unrec-input" data-doc="${g.doc}" value="${U.escHtml(curVal)}" placeholder="输入原因，自动填回原表N列..." />
-              </div>
-            </div>`;
-          }).join('')}
-        </div>
-      </div>` : ''}
 
       <div class="panel">
         <div class="toolbar" style="justify-content:space-between;">
           <div style="display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn ${state.activeView === 'main' ? 'btn-primary' : ''}" id="tab-main">材料出库单列表 (${mainRows.length})</button>
             <button class="btn ${state.activeView === 'self' ? 'btn-primary' : ''}" id="tab-self">自取物资 (${state.selfRows.length})</button>
-            ${isYellowMode && state.activeView === 'main' ? `
-              <select id="sel-filter">
-                <option value="all" ${state.filterMode === 'all' ? 'selected' : ''}>显示：全部行（原表完整顺序）</option>
-                <option value="delivery" ${state.filterMode === 'delivery' ? 'selected' : ''}>仅看：需配送 (M=是)</option>
-                <option value="unrec" ${state.filterMode === 'unrec' ? 'selected' : ''}>仅看：未回收黄单</option>
-                <option value="rec" ${state.filterMode === 'rec' ? 'selected' : ''}>仅看：已回收黄单 (N=是)</option>
-              </select>` : ''}
           </div>
-          <span style="font-size:11.5px;color:#64748b;">${isYellowMode ? '提示：点击【一键复制回填后全表】始终复制 100% 完整原顺序数据' : '纯 16 列精简与自取物资转换（不含黄单回收状态干扰）'}</span>
+          <span style="font-size:11.5px;color:#64748b;">纯 16 列精简与自取转换，与【黄单回收核对】完全独立</span>
         </div>
         <div id="m1-table-box"></div>
       </div>
     `;
 
-    // 子页切换：16列转换 vs 黄单回收
-    root.querySelector('#m1-sub-16col').onclick = () => {
-      state.subTab = '16col';
-      state.filterMode = 'all';
-      state.page = 1;
-      persistState();
-      renderModule(root);
-    };
-    root.querySelector('#m1-sub-yellow').onclick = () => {
-      state.subTab = 'yellow';
-      state.activeView = 'main';
-      state.page = 1;
-      persistState();
-      renderModule(root);
-    };
-
-    // 绑定上传 Excel
     const inXlsx = root.querySelector('#in-up-xlsx');
     root.querySelector('#btn-up-xlsx').onclick = () => inXlsx.click();
     inXlsx.onchange = async e => {
@@ -383,85 +199,14 @@
       e.target.value = '';
     };
 
-    // 仅在黄单核对子页绑定 PDF / 粘贴 / 快填栏事件
-    if (isYellowMode) {
-      const inPdf = root.querySelector('#in-up-pdf');
-      root.querySelector('#btn-up-pdf').onclick = () => inPdf.click();
-      inPdf.onchange = async e => {
-        const files = Array.from(e.target.files || []);
-        if (!files.length) return;
-        const statusEl = root.querySelector('#pdf-status');
-        try {
-          const res = await extractDocsFromPdfs(files, msg => {
-            statusEl.textContent = '⏳ ' + msg;
-          });
-          res.found.forEach(d => state.recoveredSet.add(d));
-          applyYellowAndReasons();
-          state.pdfLog = `✅ 已扫描 ${files.length} 个 PDF（共 ${res.totalPages} 页，其中 OCR 识图 ${res.ocrPages} 页），累计识别已回收单号 ${state.recoveredSet.size} 个并已精准回填 N 列。`;
-          persistState();
-          U.toast(`黄单识别完成：提取到 ${res.found.size} 个单号并回填 N 列`, 'success');
-          renderModule(root);
-        } catch (err) {
-          U.toast('PDF 识别异常：' + err.message, 'error');
-        }
-        e.target.value = '';
-      };
-
-      root.querySelector('#btn-paste-docs').onclick = () => {
-        const raw = prompt('请粘贴已回收黄单的单据号（任意文本均可，系统自动提取 CCHF/CK 单号）：');
-        if (!raw) return;
-        const matches = raw.match(DOC_REGEX) || [];
-        if (!matches.length) {
-          U.toast('未检测到有效的 CCHF/CK 单据号', 'warn');
-          return;
-        }
-        const uniqueDocs = Array.from(new Set(matches.map(m => m.toUpperCase())));
-        uniqueDocs.forEach(m => state.recoveredSet.add(m));
-        applyYellowAndReasons();
-        state.pdfLog = `✅ 手动导入 ${uniqueDocs.length} 个去重已回收单号，当前累计 ${state.recoveredSet.size} 个。`;
-        persistState();
-        U.toast(`已回填 ${uniqueDocs.length} 个已回收单号到 N 列`, 'success');
-        renderModule(root);
-      };
-
-      root.querySelectorAll('.chip-btn').forEach(btn => {
-        btn.onclick = () => {
-          const doc = btn.dataset.doc;
-          const reason = btn.dataset.reason;
-          state.unrecReasons[doc] = reason;
-          applyYellowAndReasons();
-          persistState();
-          renderModule(root);
-          U.toast(`已同步 [${doc}] -> "${reason}" 至原表对应行`, 'success');
-        };
-      });
-      root.querySelectorAll('.unrec-input').forEach(inp => {
-        inp.onchange = () => {
-          const doc = inp.dataset.doc;
-          state.unrecReasons[doc] = inp.value.trim();
-          applyYellowAndReasons();
-          persistState();
-          renderModule(root);
-        };
-      });
-    }
-
-    // 一键复制全表
     root.querySelector('#btn-copy-tsv').onclick = async () => {
       const rowsToCopy = state.activeView === 'self' ? state.selfRows : state.mainRows;
       const ok = await U.copyAsTSV(HEADERS_16, rowsToCopy, false);
-      if (ok) {
-        U.toast(`✅ 已复制 ${rowsToCopy.length} 行完整原顺序数据！直接去动态表格按 Ctrl+V 即可`, 'success');
-      } else {
-        U.toast('复制失败，请检查浏览器剪贴板权限', 'error');
-      }
+      U.toast(ok ? `✅ 已复制 ${rowsToCopy.length} 行完整原顺序数据！直接按 Ctrl+V 贴入总表即可` : '复制失败，请检查剪贴板权限', ok ? 'success' : 'error');
     };
 
-    // 导出双表 Excel
     root.querySelector('#btn-exp-xlsx').onclick = () => {
-      const outName = isYellowMode
-        ? `材料出库单列表（黄单核对版）.xlsx`
-        : `材料出库单列表（16列精简与自取）.xlsx`;
+      const outName = `材料出库单列表（16列精简与自取）.xlsx`;
       U.exportWorkbook([
         { name: '材料出库单列表', headers: HEADERS_16, rows: state.mainRows, textCols: [1, 2, 6, 15], numCols: [9], colWidths: COL_WIDTHS },
         { name: '自取物资', headers: HEADERS_16, rows: state.selfRows, textCols: [1, 2, 6, 15], numCols: [9], colWidths: COL_WIDTHS }
@@ -469,31 +214,14 @@
       U.toast('已导出：' + outName, 'success');
     };
 
-    // 视图与筛选切换
     root.querySelector('#tab-main').onclick = () => { state.activeView = 'main'; state.page = 1; renderModule(root); };
     root.querySelector('#tab-self').onclick = () => { state.activeView = 'self'; state.page = 1; renderModule(root); };
-    const selFilter = root.querySelector('#sel-filter');
-    if (selFilter) {
-      selFilter.onchange = () => { state.filterMode = selFilter.value; state.page = 1; renderModule(root); };
-    }
 
-    // 渲染分页防卡死表格（纯 16 列模式不渲染红字「待回收」干扰）
     U.renderPagedTable(root.querySelector('#m1-table-box'), {
       headers: HEADERS_16,
       rows: displayRows,
       page: state.page,
       pageSize: 100,
-      rowClassFn: isYellowMode ? (row => {
-        if (row[13] === '是') return 'row-ok';
-        if (row[12] === '是' && !row[13]) return 'row-warn';
-        return '';
-      }) : undefined,
-      cellRenderFn: isYellowMode ? ((val, row, absIdx, cIdx) => {
-        if (cIdx === 13 && val === '是') return `<span class="pill pill-green">是（已回收）</span>`;
-        if (cIdx === 13 && val) return `<span class="pill pill-orange">${U.escHtml(val)}</span>`;
-        if (cIdx === 13 && row[12] === '是') return `<span style="color:#dc2626;font-weight:600;">待回收</span>`;
-        return U.escHtml(val);
-      }) : undefined,
       onPageChange: pg => { state.page = pg; renderModule(root); }
     });
   }
@@ -501,7 +229,7 @@
   WB.register({
     id: 'mod_16col_yellow',
     icon: '📦',
-    title: '16列与黄单回收',
+    title: '16列精简与自取',
     async mount(container) {
       this._root = container;
       renderModule(container);
@@ -510,19 +238,7 @@
     },
     async handleIncomingFiles(files) {
       const excels = files.filter(f => /\.(xlsx?|csv)$/i.test(f.name));
-      const pdfs = files.filter(f => /\.pdf$/i.test(f.name));
       if (excels.length) await processExcelFile(excels[0]);
-      if (pdfs.length) {
-        state.subTab = 'yellow';
-        const res = await extractDocsFromPdfs(pdfs, msg => {
-          const el = this._root && this._root.querySelector('#pdf-status');
-          if (el) el.textContent = '⏳ ' + msg;
-        });
-        res.found.forEach(d => state.recoveredSet.add(d));
-        applyYellowAndReasons();
-        state.pdfLog = `✅ 智能导入 ${pdfs.length} 个 PDF，识别 ${res.found.size} 个单号并自动回填 N 列。`;
-        persistState();
-      }
       if (this._root) renderModule(this._root);
     }
   });

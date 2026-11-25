@@ -230,14 +230,15 @@
   <div id="wb-toast-box"></div>
 
   <!-- 核心公共库 -->
-  <script src="./core_utils.js"></script>
-  <!-- 6 大独立隔离业务模块（任一模块升级或出错，其余 5 个 100% 不受影响） -->
-  <script src="./modules/mod_hjf_embed.js"></script>
-  <script src="./modules/mod_16col_yellow.js"></script>
-  <script src="./modules/mod_photo_check.js"></script>
-  <script src="./modules/mod_stagnant.js"></script>
-  <script src="./modules/mod_ost.js"></script>
-  <script src="./modules/mod_laobao.js"></script>
+  <script src="./core_utils.js?v=20261124"></script>
+  <!-- 7 大独立隔离业务模块（任一模块升级或出错，其余模块 100% 不受影响） -->
+  <script src="./modules/mod_hjf_embed.js?v=20261124"></script>
+  <script src="./modules/mod_16col_yellow.js?v=20261124"></script>
+  <script src="./modules/mod_yellow_slip.js?v=20261124"></script>
+  <script src="./modules/mod_photo_check.js?v=20261124"></script>
+  <script src="./modules/mod_stagnant.js?v=20261124"></script>
+  <script src="./modules/mod_ost.js?v=20261124"></script>
+  <script src="./modules/mod_laobao.js?v=20261124"></script>
 
   <script>
     (function () {
@@ -246,7 +247,7 @@
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
       }
 
-      const ORDER = ['mod_hjf_embed', 'mod_16col_yellow', 'mod_photo_check', 'mod_stagnant', 'mod_ost', 'mod_laobao'];
+      const ORDER = ['mod_hjf_embed', 'mod_16col_yellow', 'mod_yellow_slip', 'mod_photo_check', 'mod_stagnant', 'mod_ost', 'mod_laobao'];
       let activeId = ORDER[0];
       try { activeId = localStorage.getItem('wb_lab_exp_active_tab') || ORDER[0]; } catch {}
       const modErrors = {};
@@ -302,9 +303,9 @@
           switchTab('mod_photo_check', imgs);
           return;
         }
-        // 2. 纯 PDF -> 如果当前在照片核对页则给照片页，否则默认给黄单回收核对页
+        // 2. 纯 PDF -> 如果当前在照片核对页则给照片页，否则默认给独立【黄单回收核对】页
         if (pdfs.length > 0 && excels.length === 0) {
-          const target = activeId === 'mod_photo_check' ? 'mod_photo_check' : 'mod_16col_yellow';
+          const target = activeId === 'mod_photo_check' ? 'mod_photo_check' : 'mod_yellow_slip';
           WB.Utils.toast(`智能识别：${pdfs.length} 个扫描 PDF -> 跳转【${WB.modules[target].title}】`, 'success');
           switchTab(target, pdfs);
           return;
@@ -316,18 +317,23 @@
           switchTab('mod_stagnant', files);
           return;
         }
-        if (/OST|P9|现存量|横版/i.test(namesJoined)) {
-          WB.Utils.toast('智能识别：OST 物资/现存量 -> 跳转【OST P9与日报】', 'success');
+        if (/OST|P9|现存量|横版|箱件/i.test(namesJoined)) {
+          WB.Utils.toast('智能识别：OST 物资/现存量 -> 跳转【OST 每日筛选与P9】', 'success');
           switchTab('mod_ost', files);
           return;
         }
         if (/劳保|人员名单|空白表格/i.test(namesJoined)) {
-          WB.Utils.toast('智能识别：劳保物资表 -> 跳转【劳保物资统计】', 'success');
+          WB.Utils.toast('智能识别：劳保物资表 -> 跳转【劳保发放统计】', 'success');
           switchTab('mod_laobao', files);
           return;
         }
-        if (/材料出库单|黄单|精简/i.test(namesJoined) || pdfs.length > 0) {
-          WB.Utils.toast('智能识别：材料出库单/黄单 -> 跳转【16列与黄单回收】', 'success');
+        if (/黄单/i.test(namesJoined) || pdfs.length > 0) {
+          WB.Utils.toast('智能识别：黄单追踪表/PDF -> 跳转【黄单回收核对】', 'success');
+          switchTab('mod_yellow_slip', files);
+          return;
+        }
+        if (/材料出库单|精简/i.test(namesJoined)) {
+          WB.Utils.toast('智能识别：ERP 材料出库单 -> 跳转【16列精简与自取】', 'success');
           switchTab('mod_16col_yellow', files);
           return;
         }
@@ -342,13 +348,13 @@
           const firstSheet = parsed.sheets[parsed.sheetNames[0]] || [];
           const headStr = firstSheet.slice(0, 5).flat().join(' ');
           if (headStr.includes('出入库类型') && headStr.includes('实发数量')) {
-            WB.Utils.toast('表头智能识别：ERP 材料出库单 -> 跳转【16列与黄单回收】', 'success');
+            WB.Utils.toast('表头智能识别：ERP 材料出库单 -> 跳转【16列精简与自取】', 'success');
             switchTab('mod_16col_yellow', files);
           } else if (headStr.includes('结存主数量')) {
             WB.Utils.toast('表头智能识别：呆滞品底表 -> 跳转【呆滞品核扣】', 'success');
             switchTab('mod_stagnant', files);
           } else if (headStr.includes('现存') || headStr.includes('子项号')) {
-            WB.Utils.toast('表头智能识别：OST 表格 -> 跳转【OST P9与日报】', 'success');
+            WB.Utils.toast('表头智能识别：OST 表格 -> 跳转【OST 每日筛选与P9】', 'success');
             switchTab('mod_ost', files);
           } else {
             WB.Utils.toast('已载入当前页面，若需切换请手动点击上方标签', 'warn');
