@@ -15,6 +15,9 @@
   const QUICK_REASONS = ['车间未签回', '今日未送达', '补交中', '现场自取未标', '黄单遗失待补'];
   const DOC_REGEX = /(?:CCHF|CK)\d{10,22}/gi;
 
+  let activeRoot = null;
+  let ocrWorkers = null;
+
   let state = {
     rows: [],           // 16列黄单追踪表（原行序100%锁死）
     hasHeaderInSource: false,
@@ -23,8 +26,26 @@
     filterMode: 'all',  // 'all' | 'delivery' | 'unrec' | 'rec'
     page: 1,
     pdfLog: '',
-    sourceName: ''
+    scanning: false,
+    sourceName: '',
+    _hydrated: false
   };
+
+  function setGlobalBgPill(text, show = true, done = false) {
+    const el = document.getElementById('wb-bg-pill');
+    if (!el) return;
+    if (!show) { el.style.display = 'none'; return; }
+    el.style.display = 'inline-block';
+    el.style.background = done ? '#15803d' : '#1d4ed8';
+    el.style.color = done ? '#dcfce7' : '#dbeafe';
+    el.textContent = text;
+  }
+
+  function refreshIfVisible() {
+    if (activeRoot && activeRoot.isConnected) {
+      renderModule(activeRoot);
+    }
+  }
 
   function persistState() {
     WB.Store.save('mod_yellow_slip', {
@@ -38,8 +59,10 @@
   }
 
   async function hydrateState() {
+    // 后台扫描运行中或已完成内存水合时，绝不用旧缓存覆写当前内存进度
+    if (state.scanning || state._hydrated) return;
     const saved = await WB.Store.load('mod_yellow_slip');
-    if (saved) {
+    if (saved && !state.scanning) {
       state.rows = saved.rows || [];
       state.hasHeaderInSource = !!saved.hasHeaderInSource;
       state.recoveredSet = new Set(saved.recoveredList || []);
@@ -47,6 +70,7 @@
       state.pdfLog = saved.pdfLog || '';
       state.sourceName = saved.sourceName || '';
     }
+    state._hydrated = true;
   }
 
   function findCol(headers, candidates) {
@@ -180,42 +204,145 @@
     }
   }
 
-  async function extractDocsFromPdfs(pdfFiles, progressCb) {
-    const found = new Set();
-    let totalPages = 0;
-    let ocrPages = 0;
-
-    for (const file of pdfFiles) {
-      const buf = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-      totalPages += pdf.numPages;
-
-      for (let p = 1; p <= pdf.numPages; p++) {
-        progressCb(`正在扫描 ${file.name} 第 ${p}/${pdf.numPages} 页...`);
-        const page = await pdf.getPage(p);
-        const textContent = await page.getTextContent();
-        const pageText = textContent.items.map(it => it.str).join(' ');
-        const matches = pageText.match(DOC_REGEX) || [];
-        if (matches.length > 0) {
-          matches.forEach(m => found.add(m.toUpperCase()));
-        } else if (window.Tesseract) {
-          ocrPages++;
-          progressCb(`第 ${p}/${pdf.numPages} 页为纯图片扫描件，正在 OCR 提取单号...`);
-          const viewport = page.getViewport({ scale: 1.8 });
-          const canvas = document.createElement('canvas');
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-          const res = await Tesseract.recognize(canvas, 'eng', {
-            tessedit_char_whitelist: 'CCHFK0123456789'
-          });
-          const ocrText = (res.data.text || '').replace(/\s+/g, '');
-          const ocrMatches = ocrText.match(/(?:CCHF|CK)\d{10,22}/gi) || [];
-          ocrMatches.forEach(m => found.add(m.toUpperCase()));
-        }
-      }
+  async function getOcrWorkerPool() {
+    if (!window.Tesseract || typeof Tesseract.createWorker !== 'function') return null;
+    if (ocrWorkers && ocrWorkers.length) return ocrWorkers;
+    const pool = [];
+    const concurrency = 2; // 双 Worker 并行复用，告别每页重启引擎的卡顿
+    for (let i = 0; i < concurrency; i++) {
+      const w = await Tesseract.createWorker('eng');
+      await w.setParameters({ tessedit_char_whitelist: 'CCHFK0123456789' });
+      pool.push(w);
     }
-    return { found, totalPages, ocrPages };
+    ocrWorkers = pool;
+    return pool;
+  }
+
+  /** 后台常驻扫描 PDF：可随时切去其他板块干活，绝不中断、绝不丢进度，每页扫出即实时回填 N 列 */
+  function startBackgroundPdfScan(pdfFiles) {
+    const files = Array.from(pdfFiles || []);
+    if (!files.length) return;
+    if (state.scanning) {
+      U.toast('后台正在识别上一批 PDF，请稍候完成后再追加', 'warn');
+      return;
+    }
+
+    state.scanning = true;
+    state.pdfLog = `⏳ 后台已启动：正在解析 ${files.length} 个 PDF（可自由切换其他标签页干活，绝不中断）...`;
+    setGlobalBgPill(`⏳ 黄单PDF后台识别启动中...`, true, false);
+    refreshIfVisible();
+    U.toast('黄单 PDF 已转入后台极速识别，你可随时切去其他板块干活！', 'info');
+
+    // 独立异步后台执行，绝不阻塞 UI 与标签页切换
+    (async () => {
+      let totalPages = 0;
+      let donePages = 0;
+      let ocrPages = 0;
+      let newlyFound = 0;
+
+      const updateProgress = (msg) => {
+        state.pdfLog = `⏳ ${msg}（可自由切换其他标签页）`;
+        setGlobalBgPill(`⏳ 黄单PDF ${donePages}/${totalPages || '?'}页 · 累计 ${state.recoveredSet.size} 单`, true, false);
+        const stEl = activeRoot && activeRoot.isConnected ? activeRoot.querySelector('#y-pdf-status') : null;
+        if (stEl) stEl.textContent = state.pdfLog;
+      };
+
+      try {
+        // 1. 先载入全部 PDF 并统计总页数
+        const loadedPdfs = [];
+        for (const f of files) {
+          const buf = await f.arrayBuffer();
+          const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+          totalPages += pdf.numPages;
+          loadedPdfs.push({ name: f.name, pdf });
+        }
+
+        // 2. 第一遍：毫秒级扫描全部页面的文本层，把需要 OCR 的纯图片页收入队列
+        const ocrQueue = [];
+        for (const item of loadedPdfs) {
+          for (let p = 1; p <= item.pdf.numPages; p++) {
+            const page = await item.pdf.getPage(p);
+            const textContent = await page.getTextContent();
+            const pageText = textContent.items.map(it => it.str).join(' ');
+            const matches = pageText.match(DOC_REGEX) || [];
+            if (matches.length > 0) {
+              let changed = false;
+              matches.forEach(m => {
+                const up = m.toUpperCase();
+                if (!state.recoveredSet.has(up)) { state.recoveredSet.add(up); newlyFound++; changed = true; }
+              });
+              donePages++;
+              if (changed) {
+                applyYellowAndReasons();
+                persistState();
+                refreshIfVisible();
+              }
+              updateProgress(`高速文本层扫描 ${donePages}/${totalPages} 页...`);
+            } else {
+              ocrQueue.push({ name: item.name, p, page });
+            }
+          }
+        }
+
+        // 3. 第二遍：纯图片扫描页 -> 复用 2 个并行 OCR Worker 极速识别，每识别完 1 页实时回填落盘
+        if (ocrQueue.length > 0 && window.Tesseract) {
+          updateProgress(`文本层完成，正在启动双核 OCR 引擎处理 ${ocrQueue.length} 页纯图片扫描件...`);
+          const pool = await getOcrWorkerPool();
+          let qIdx = 0;
+
+          async function runWorker(worker) {
+            while (qIdx < ocrQueue.length) {
+              const job = ocrQueue[qIdx++];
+              ocrPages++;
+              const viewport = job.page.getViewport({ scale: 1.5 });
+              const canvas = document.createElement('canvas');
+              canvas.width = viewport.width;
+              canvas.height = viewport.height;
+              await job.page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+
+              const res = worker
+                ? await worker.recognize(canvas)
+                : await Tesseract.recognize(canvas, 'eng', { tessedit_char_whitelist: 'CCHFK0123456789' });
+
+              const ocrText = (res.data.text || '').replace(/\s+/g, '');
+              const ocrMatches = ocrText.match(/(?:CCHF|CK)\d{10,22}/gi) || [];
+              let changed = false;
+              ocrMatches.forEach(m => {
+                const up = m.toUpperCase();
+                if (!state.recoveredSet.has(up)) { state.recoveredSet.add(up); newlyFound++; changed = true; }
+              });
+              donePages++;
+              if (changed) {
+                applyYellowAndReasons();
+                persistState();
+                refreshIfVisible();
+              }
+              updateProgress(`后台 OCR 识别中 ${donePages}/${totalPages} 页（已新增 ${newlyFound} 单）`);
+            }
+          }
+
+          if (pool && pool.length) {
+            await Promise.all(pool.map(w => runWorker(w)));
+          } else {
+            await runWorker(null);
+          }
+        }
+
+        applyYellowAndReasons();
+        state.pdfLog = `✅ 后台识别完成：共扫描 ${files.length} 个 PDF（${totalPages} 页，其中 OCR ${ocrPages} 页），本次新增 ${newlyFound} 单，累计已回收 ${state.recoveredSet.size} 单并已精准回填 N 列。`;
+        persistState();
+        setGlobalBgPill(`✅ 黄单PDF已完成 (+${newlyFound}单)`, true, true);
+        setTimeout(() => { if (!state.scanning) setGlobalBgPill('', false); }, 10000);
+        U.toast(`黄单 PDF 后台扫描完成！新增 ${newlyFound} 个单号已自动回填 N 列`, 'success');
+      } catch (err) {
+        state.pdfLog = `❌ PDF 识别异常：${err.message}`;
+        setGlobalBgPill('', false);
+        U.toast('PDF 识别异常：' + err.message, 'error');
+      } finally {
+        state.scanning = false;
+        refreshIfVisible();
+      }
+    })();
   }
 
   function getUnrecoveredGroups() {
@@ -337,22 +464,11 @@
 
     const inPdf = root.querySelector('#y-in-pdf');
     root.querySelector('#y-up-pdf').onclick = () => inPdf.click();
-    inPdf.onchange = async e => {
+    inPdf.onchange = e => {
       const files = Array.from(e.target.files || []);
-      if (!files.length) return;
-      const statusEl = root.querySelector('#y-pdf-status');
-      try {
-        const res = await extractDocsFromPdfs(files, msg => { statusEl.textContent = '⏳ ' + msg; });
-        res.found.forEach(d => state.recoveredSet.add(d));
-        applyYellowAndReasons();
-        state.pdfLog = `✅ 已扫描 ${files.length} 个 PDF（共 ${res.totalPages} 页，OCR ${res.ocrPages} 页），累计识别 ${state.recoveredSet.size} 个单号并已回填 N 列。`;
-        persistState();
-        U.toast(`黄单识别完成：提取到 ${res.found.size} 个单号并回填 N 列`, 'success');
-        renderModule(root);
-      } catch (err) {
-        U.toast('PDF 识别异常：' + err.message, 'error');
-      }
       e.target.value = '';
+      if (!files.length) return;
+      startBackgroundPdfScan(files);
     };
 
     root.querySelector('#y-paste-docs').onclick = () => {
@@ -443,25 +559,19 @@
     title: '黄单回收核对',
     async mount(container) {
       this._root = container;
+      activeRoot = container;
       renderModule(container);
       await hydrateState();
-      renderModule(container);
+      if (activeRoot === container && container.isConnected) {
+        renderModule(container);
+      }
     },
     async handleIncomingFiles(files) {
       const excels = files.filter(f => /\.(xlsx?|csv)$/i.test(f.name));
       const pdfs = files.filter(f => /\.pdf$/i.test(f.name));
       if (excels.length) await loadYellowTable(excels[0]);
-      if (pdfs.length) {
-        const res = await extractDocsFromPdfs(pdfs, msg => {
-          const el = this._root && this._root.querySelector('#y-pdf-status');
-          if (el) el.textContent = '⏳ ' + msg;
-        });
-        res.found.forEach(d => state.recoveredSet.add(d));
-        applyYellowAndReasons();
-        state.pdfLog = `✅ 智能导入 ${pdfs.length} 个 PDF，识别 ${res.found.size} 个单号并已回填 N 列。`;
-        persistState();
-      }
-      if (this._root) renderModule(this._root);
+      if (pdfs.length) startBackgroundPdfScan(pdfs);
+      refreshIfVisible();
     }
   });
 })();
