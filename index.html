@@ -180,6 +180,18 @@
     select, input[type="text"], input[type="date"] {
       border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px 9px; font-size: 12.5px;
     }
+    .btn.drop-hover {
+      outline: 2.5px dashed #2563eb !important;
+      outline-offset: 2px;
+      transform: scale(1.03);
+      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.22);
+    }
+    #main-container.drop-hover {
+      outline: 3px dashed #3b82f6;
+      outline-offset: -8px;
+      background: rgba(219, 234, 254, 0.35);
+      border-radius: 12px;
+    }
   </style>
 </head>
 <body>
@@ -369,13 +381,91 @@
       const fileInput = document.getElementById('global-file-input');
       dropEl.onclick = () => fileInput.click();
       fileInput.onchange = e => { routeFiles(e.target.files); fileInput.value = ''; };
-      dropEl.ondragover = e => { e.preventDefault(); dropEl.classList.add('dragover'); };
+      dropEl.ondragover = e => { e.preventDefault(); e.stopPropagation(); dropEl.classList.add('dragover'); };
       dropEl.ondragleave = () => dropEl.classList.remove('dragover');
       dropEl.ondrop = e => {
         e.preventDefault();
+        e.stopPropagation();
         dropEl.classList.remove('dragover');
         routeFiles(e.dataTransfer.files);
       };
+
+      // 全局防误打开：拦截拖到空白处导致浏览器直接下载/打开文件
+      window.addEventListener('dragover', e => e.preventDefault());
+      window.addEventListener('drop', e => e.preventDefault());
+
+      // 当前模块整页拖拽 + 任意上传按钮精准拖拽支持（全部 7 个模块自动生效）
+      const mainEl = document.getElementById('main-container');
+      let lastHoverBtn = null;
+      function findUploadBtnAndInput(target) {
+        const btn = target && target.closest ? target.closest('button') : null;
+        if (!btn || !mainEl.contains(btn)) return null;
+        const next = btn.nextElementSibling;
+        if (next && next.tagName === 'INPUT' && next.type === 'file') {
+          return { btn, input: next };
+        }
+        return null;
+      }
+
+      mainEl.addEventListener('dragover', e => {
+        if (e.target && e.target.closest && e.target.closest('#p-media-drop')) return;
+        e.preventDefault();
+        const hit = findUploadBtnAndInput(e.target);
+        if (lastHoverBtn && (!hit || hit.btn !== lastHoverBtn)) {
+          lastHoverBtn.classList.remove('drop-hover');
+          lastHoverBtn = null;
+        }
+        if (hit) {
+          hit.btn.classList.add('drop-hover');
+          lastHoverBtn = hit.btn;
+          mainEl.classList.remove('drop-hover');
+        } else {
+          mainEl.classList.add('drop-hover');
+        }
+      });
+
+      mainEl.addEventListener('dragleave', e => {
+        if (e.relatedTarget && mainEl.contains(e.relatedTarget)) return;
+        mainEl.classList.remove('drop-hover');
+        if (lastHoverBtn) { lastHoverBtn.classList.remove('drop-hover'); lastHoverBtn = null; }
+      });
+
+      mainEl.addEventListener('drop', async e => {
+        if (e.target && e.target.closest && e.target.closest('#p-media-drop')) return;
+        e.preventDefault();
+        mainEl.classList.remove('drop-hover');
+        if (lastHoverBtn) { lastHoverBtn.classList.remove('drop-hover'); lastHoverBtn = null; }
+
+        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+        if (!files.length) return;
+
+        // 1. 精准拖到某个上传按钮上 -> 直接喂给该按钮对应的 <input type="file">
+        const hit = findUploadBtnAndInput(e.target);
+        if (hit) {
+          try {
+            const dt = new DataTransfer();
+            const list = hit.input.multiple ? files : [files[0]];
+            list.forEach(f => dt.items.add(f));
+            hit.input.files = dt.files;
+            hit.input.dispatchEvent(new Event('change', { bubbles: true }));
+          } catch (err) {
+            WB.Utils.toast('拖入导入失败：' + err.message, 'error');
+          }
+          return;
+        }
+
+        // 2. 拖到当前模块页面的任意空白/表格区 -> 直接交给当前所在模块处理（绝不乱跳标签页）
+        const mod = WB.modules[activeId];
+        if (mod && typeof mod.handleIncomingFiles === 'function') {
+          try {
+            await mod.handleIncomingFiles(files);
+          } catch (err) {
+            WB.Utils.toast('当前模块导入失败：' + err.message, 'error');
+          }
+        } else {
+          WB.Utils.toast('请将文件直接拖入当前页面的导入区或上传按钮', 'info');
+        }
+      });
 
       // 绑定实时运输配置弹窗
       const syncModal = document.getElementById('sync-modal');
