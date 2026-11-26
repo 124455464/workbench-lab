@@ -6,10 +6,22 @@
   'use strict';
   const U = WB.Utils;
 
+  function deepCloneSheets(obj) {
+    return JSON.parse(JSON.stringify(obj || {}));
+  }
+
   let state = {
+    // 留存基线层（默认保留上次导入或上次导出定稿后的底表，下次只拖出库单即可直接算下一轮）
+    savedBaseSheets: {},
+    savedSheetNames: [],
+    savedBaseLabel: '',
+    autoSaveOnExport: true,
+    // 当前工作层（每次导入材料出库单都从留存基线层干净克隆计算，支持反复多次筛选不扣重）
     baseSheets: {},      // { sheetName: { headers, rows } }
     sheetNames: [],
     activeSheet: '',
+    hasPendingRun: false,
+    flowFileName: '',
     flowCount: 0,
     matchedCount: 0,
     periodLabel: '',
@@ -19,9 +31,15 @@
 
   function persistState() {
     WB.Store.save('mod_stagnant', {
+      savedBaseSheets: state.savedBaseSheets,
+      savedSheetNames: state.savedSheetNames,
+      savedBaseLabel: state.savedBaseLabel,
+      autoSaveOnExport: state.autoSaveOnExport,
       baseSheets: state.baseSheets,
       sheetNames: state.sheetNames,
       activeSheet: state.activeSheet,
+      hasPendingRun: state.hasPendingRun,
+      flowFileName: state.flowFileName,
       flowCount: state.flowCount,
       matchedCount: state.matchedCount,
       periodLabel: state.periodLabel,
@@ -32,9 +50,15 @@
   async function hydrateState() {
     const saved = await WB.Store.load('mod_stagnant');
     if (saved) {
-      state.baseSheets = saved.baseSheets || {};
-      state.sheetNames = saved.sheetNames || [];
+      state.savedBaseSheets = saved.savedBaseSheets || saved.baseSheets || {};
+      state.savedSheetNames = saved.savedSheetNames || saved.sheetNames || [];
+      state.savedBaseLabel = saved.savedBaseLabel || (state.savedSheetNames.length ? '上次留存底表' : '');
+      state.autoSaveOnExport = saved.autoSaveOnExport !== undefined ? !!saved.autoSaveOnExport : true;
+      state.baseSheets = saved.baseSheets || deepCloneSheets(state.savedBaseSheets);
+      state.sheetNames = saved.sheetNames || [...state.savedSheetNames];
       state.activeSheet = saved.activeSheet || state.sheetNames[0] || '';
+      state.hasPendingRun = !!saved.hasPendingRun;
+      state.flowFileName = saved.flowFileName || '';
       state.flowCount = saved.flowCount || 0;
       state.matchedCount = saved.matchedCount || 0;
       state.periodLabel = saved.periodLabel || '';
@@ -84,19 +108,51 @@
         rows: aoa.slice(1).map(r => r.map(v => U.cleanStr(v)))
       };
     });
+    // 同时设为留存默认基线 + 当前工作表
+    state.savedBaseSheets = deepCloneSheets(sheets);
+    state.savedSheetNames = [...names];
+    state.savedBaseLabel = file.name;
     state.baseSheets = sheets;
     state.sheetNames = names;
     state.activeSheet = names[0] || '';
+    state.hasPendingRun = false;
+    state.flowFileName = '';
+    state.flowCount = 0;
+    state.matchedCount = 0;
+    state.consumeLog = [];
     state.page = 1;
     persistState();
-    U.toast(`已载入呆滞品底表：${names.join(' / ')}`, 'success');
+    U.toast(`已载入并留存默认底表：${file.name}（后续直接拖入材料出库单即可反复筛选）`, 'success');
+  }
+
+  function resetToSavedBase() {
+    if (!state.savedSheetNames.length) return;
+    state.baseSheets = deepCloneSheets(state.savedBaseSheets);
+    state.sheetNames = [...state.savedSheetNames];
+    state.activeSheet = state.sheetNames[0] || '';
+    state.hasPendingRun = false;
+    state.flowFileName = '';
+    state.flowCount = 0;
+    state.matchedCount = 0;
+    state.consumeLog = [];
+    state.page = 1;
+    persistState();
   }
 
   async function applyFlowFile(file) {
-    if (!state.sheetNames.length) {
-      U.toast('请先上传【呆滞品底表】', 'warn');
+    if (!state.savedSheetNames.length && !state.sheetNames.length) {
+      U.toast('尚无留存底表，请先导入一次呆滞品底表', 'warn');
       return;
     }
+    // 铁律：每次导入材料出库单都从「留存默认底表」干净克隆重算，可无限次重复筛选绝不扣重！
+    if (state.savedSheetNames.length) {
+      state.baseSheets = deepCloneSheets(state.savedBaseSheets);
+      state.sheetNames = [...state.savedSheetNames];
+    } else {
+      state.savedBaseSheets = deepCloneSheets(state.baseSheets);
+      state.savedSheetNames = [...state.sheetNames];
+    }
+
     const parsed = await U.readSpreadsheet(file);
     const aoa = parsed.sheets[parsed.sheetNames[0]] || [];
     let hdrIdx = 0;
@@ -253,11 +309,13 @@
       consumeLog.forEach(r => shStat.rows.push(r.map(v => (v === null || v === undefined ? '' : String(v)))));
     }
 
+    state.hasPendingRun = true;
+    state.flowFileName = file.name;
     state.flowCount = flowCount;
     state.matchedCount = matched;
     state.consumeLog = consumeLog;
     persistState();
-    U.toast(`核扣完成：流水 ${flowCount} 笔，命中呆滞品 ${matched} 项（已按 9 列标准格式生成消耗量统计，公司固定 HJF）`, 'success');
+    U.toast(`核扣完成（基于留存底表，可随时重拖其他出库单重算）：流水 ${flowCount} 笔，命中呆滞品 ${matched} 项`, 'success');
   }
 
   const CONSUME_HEADERS_9 = ['序号', '日期', '姓名', '公司', '物资编码', '物资名称', '单位', '消耗数量', '备注'];
@@ -267,12 +325,31 @@
     const cur = isConsumeView
       ? { headers: CONSUME_HEADERS_9, rows: state.consumeLog }
       : state.baseSheets[state.activeSheet];
+    const hasSavedBase = state.savedSheetNames.length > 0;
 
     root.innerHTML = `
+      <div class="panel" style="background:#f0f9ff;border-color:#7dd3fc;">
+        <div class="panel-title" style="margin-bottom:6px;">
+          <span>📌 上次留存默认底表（下一次只需直接拖入【材料出库单】即可自动筛选下一轮）</span>
+          <span class="pill ${hasSavedBase ? 'pill-green' : 'pill-orange'}">
+            ${hasSavedBase ? `当前默认底表：${U.escHtml(state.savedBaseLabel || '已留存底表')}` : '尚未留存底表（请先导入一次初始底表）'}
+          </span>
+        </div>
+        <div class="toolbar" style="margin-bottom:0;">
+          <button class="btn" id="s-up-base">📂 ${hasSavedBase ? '更换 / 手动导入新底表' : '导入初始呆滞品底表 (.xlsx)'}</button>
+          <input type="file" id="s-in-base" accept=".xlsx,.xls" class="hidden-input" />
+          ${state.hasPendingRun ? `<button class="btn btn-warning" id="s-reset-base" title="放弃当前试算结果，还原到上方留存默认底表">↩️ 还原到留存底表</button>` : ''}
+          <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#0369a1;cursor:pointer;margin-left:6px;">
+            <input type="checkbox" id="s-autosave-exp" ${state.autoSaveOnExport ? 'checked' : ''} />
+            导出总表时，自动将本次导出结果留存为下一次默认底表
+          </label>
+        </div>
+      </div>
+
       <div class="panel">
         <div class="panel-title">
-          <span>🧱 呆滞品多轮核扣（分页防卡死 · 11位前导0强保 · 公司固定HJF · 退库写负数）</span>
-          <span class="pill pill-blue">${state.sheetNames.length ? '已加载 ' + state.sheetNames.length + ' 个工作表' : '待导入底表'}</span>
+          <span>🧱 呆滞品出库核扣（可重复多次导入出库单试跑，绝不破坏留存底表 · 公司固定HJF · 退库写负数）</span>
+          <span class="pill pill-blue">${state.hasPendingRun ? `当前试算流水：${U.escHtml(state.flowFileName)}` : (hasSavedBase ? '就绪：直接拖入材料出库单即可筛选' : '待导入底表')}</span>
         </div>
         <div class="kpi-grid">
           <div class="kpi-card blue"><div class="kpi-label">当前工作表行数</div><div class="kpi-val">${cur ? cur.rows.length : 0}</div></div>
@@ -281,10 +358,8 @@
           <div class="kpi-card orange"><div class="kpi-label">本期消耗量统计条数</div><div class="kpi-val">${state.consumeLog.length}</div></div>
         </div>
         <div class="toolbar">
-          <button class="btn btn-primary" id="s-up-base">📂 1. 导入上一轮呆滞品底表</button>
-          <input type="file" id="s-in-base" accept=".xlsx,.xls" class="hidden-input" />
-          <input type="text" id="s-period" value="${U.escHtml(state.periodLabel)}" placeholder="新列名，如：11.20-11.26出库数量" style="width:210px;" />
-          <button class="btn btn-warning" id="s-up-flow">📥 2. 导入本期出入库流水账</button>
+          <input type="text" id="s-period" value="${U.escHtml(state.periodLabel)}" placeholder="新列名，如：第十一次出库数量" style="width:220px;" />
+          <button class="btn btn-primary" id="s-up-flow">📥 导入材料出库单筛选（可重复拖入重算）</button>
           <input type="file" id="s-in-flow" accept=".xlsx,.xls,.csv" class="hidden-input" />
           <span style="flex:1"></span>
           <button class="btn" id="s-copy-consume" ${!state.consumeLog.length ? 'disabled' : ''}>📋 一键复制本期消耗量 (9列)</button>
@@ -302,6 +377,19 @@
     `;
 
     root.querySelector('#s-period').oninput = e => { state.periodLabel = e.target.value; };
+    root.querySelector('#s-autosave-exp').onchange = e => {
+      state.autoSaveOnExport = e.target.checked;
+      persistState();
+    };
+    const btnReset = root.querySelector('#s-reset-base');
+    if (btnReset) {
+      btnReset.onclick = () => {
+        resetToSavedBase();
+        renderModule(root);
+        U.toast('已还原到上次留存的默认底表', 'info');
+      };
+    }
+
     const inBase = root.querySelector('#s-in-base');
     root.querySelector('#s-up-base').onclick = () => inBase.click();
     inBase.onchange = async e => { if (e.target.files[0]) { await loadBaseFile(e.target.files[0]); renderModule(root); } e.target.value = ''; };
@@ -344,8 +432,23 @@
           colWidths: [8, 12, 10, 8, 15, 28, 8, 12, 16]
         });
       }
-      U.exportWorkbook(cfgs, `呆滞品核扣结果.xlsx`);
-      U.toast('已导出呆滞品核扣结果.xlsx', 'success');
+      const tag = state.periodLabel.trim() || '本期';
+      U.exportWorkbook(cfgs, `呆滞品核扣结果_${tag}.xlsx`);
+
+      // 导出后自动将本次定稿结果留存为下一次的默认底表！
+      if (state.autoSaveOnExport && state.hasPendingRun) {
+        state.savedBaseSheets = deepCloneSheets(state.baseSheets);
+        state.savedSheetNames = [...state.sheetNames];
+        const ts = new Date().toTimeString().slice(0, 5);
+        state.savedBaseLabel = `上次导出留存（${tag} · ${ts}）`;
+        state.hasPendingRun = false;
+        state.periodLabel = '';
+        persistState();
+        renderModule(root);
+        U.toast(`已导出并自动留存为下轮默认底表！下次直接拖材料出库单即可筛选下一轮`, 'success');
+      } else {
+        U.toast(`已导出呆滞品核扣结果_${tag}.xlsx`, 'success');
+      }
     };
 
     if (cur) {
