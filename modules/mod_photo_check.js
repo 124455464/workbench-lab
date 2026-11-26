@@ -118,7 +118,22 @@
     U.toast(`从 [${bestSn}] 按空行切分出 ${tickets.length} 张非气体独立单据（已自动剔除全部气体）`, 'success');
   }
 
+  function revokeMediaUrls() {
+    (state.mediaUrls || []).forEach(m => {
+      if (m && m.url && String(m.url).startsWith('blob:')) {
+        try { URL.revokeObjectURL(m.url); } catch (_) {}
+      }
+    });
+  }
+  window.addEventListener('beforeunload', revokeMediaUrls);
+
   async function loadMediaFiles(files) {
+    // 若一次性上传多张新图且内存里已堆积超过 60 张旧预览，自动释放旧 blob 防内存泄漏
+    if ((state.mediaUrls || []).length >= 60 && files.length > 0) {
+      revokeMediaUrls();
+      state.mediaUrls = [];
+      state.activeMediaIdx = 0;
+    }
     for (const f of files) {
       if (/\.pdf$/i.test(f.name) && window.pdfjsLib) {
         const buf = await f.arrayBuffer();

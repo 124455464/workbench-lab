@@ -17,6 +17,19 @@
 
   let activeRoot = null;
   let ocrWorkers = null;
+  let ocrIdleTimer = null;
+
+  function scheduleOcrWorkerCleanup() {
+    clearTimeout(ocrIdleTimer);
+    ocrIdleTimer = setTimeout(async () => {
+      if (state.scanning || !ocrWorkers || !ocrWorkers.length) return;
+      const toKill = ocrWorkers;
+      ocrWorkers = null;
+      for (const w of toKill) {
+        try { await w.terminate(); } catch (_) {}
+      }
+    }, 90000); // 识别全部结束空闲 90 秒后自动释放 ~400MB WASM 内存
+  }
 
   let state = {
     rows: [],           // 16列黄单追踪表（原行序100%锁死）
@@ -340,6 +353,7 @@
         U.toast('PDF 识别异常：' + err.message, 'error');
       } finally {
         state.scanning = false;
+        scheduleOcrWorkerCleanup();
         refreshIfVisible();
       }
     })();

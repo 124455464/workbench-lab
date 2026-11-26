@@ -145,6 +145,13 @@
         clearTimeout(pushTimers[modId]);
         pushTimers[modId] = setTimeout(async () => {
           try {
+            const payloadStr = JSON.stringify(wrapped);
+            // 单模块超过 1.5MB（如 8000+ 条大现存量表）跳过云 Gist 防卡顿/422，保留本机 IndexedDB 缓存
+            if (payloadStr.length > 1500000) {
+              const t = new Date().toTimeString().slice(0, 8);
+              setSyncPill(`🔵 大表已存本机缓存 ${t}（跳过云端防卡顿）`, 'local');
+              return;
+            }
             const res = await fetch(`https://api.github.com/gists/${gistId}`, {
               method: 'PATCH',
               headers: {
@@ -153,7 +160,7 @@
                 'Content-Type': 'application/json'
               },
               body: JSON.stringify({
-                files: { [`${modId}.json`]: { content: JSON.stringify(wrapped) } }
+                files: { [`${modId}.json`]: { content: payloadStr } }
               })
             });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
