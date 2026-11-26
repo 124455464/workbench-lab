@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>HJF 物资申报出库一键核算前端工具 v3.3（智能数量列校准 + 多文件批量连算）</title>
+  <title>HJF 物资申报出库一键核算前端工具 v3.4（隐藏表过滤 + 智能数量列校准 + 多文件批量连算）</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
   <style>
@@ -1127,7 +1127,7 @@ const DEPT_MAPS = [
   { keys: ["质检部", "化验室", "质检中心", "检化验", "实验室", "LABOLATORIUM", "LABORATORIUM", "LABORATORY"], persons: ["赵丽红"], std: "质检部", prefix: "LABOLATORIUM", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "lab", rank: 120 },
   { keys: ["火法码头", "码头运营中心", "码头", "JETTY HJF", "JETTY"], persons: ["李国胜"], std: "火法码头", prefix: "JETTY HJF", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 130 },
   { keys: ["设备部", "设备科", "EQUIPMENT"], persons: [], std: "设备部", prefix: "EQUIPMENT", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 140 },
-  { keys: ["氧气站", "制氧站", "制氧车间", "制氧", "OXYGEN STATION", "OXYGEN"], persons: [], std: "氧气站", prefix: "OXYGEN STATION", project: "自制氧气生产", line: "镍铁冶炼共用", type: "oxygen", rank: 150 },
+  { keys: ["氧气站", "制氧站", "制氧车间", "制氧", "OXYGEN STATION", "OXYGEN"], persons: [], std: "氧气站", prefix: "OXYGEN STATION", project: "HF999999999YQ9999", line: "镍铁冶炼共用", type: "oxygen", rank: 150 },
   { keys: ["电仪部", "电力服务中心", "变电站", "供电车间", "电气车间", "电仪", "ELEKTRIK", "ELEKTRIX", "ELECTRICAL"], persons: ["刘善森"], std: "电仪部", prefix: "ELEKTRIK", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "prod", rank: 160 },
   { keys: ["调度中心", "调度", "DISPATCH"], persons: ["李留震"], std: "调度中心", prefix: "DISPATCH", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "auto", rank: 170 },
   { keys: ["汽修厂", "P2汽修", "运输汽修部", "汽修车间", "汽修班", "汽修", "WORKSHOP"], persons: ["王龙"], std: "汽修厂", prefix: "WORKSHOP", project: "HF999999999NT9999", line: "镍铁冶炼共用", type: "auto", rank: 180 },
@@ -1295,10 +1295,24 @@ function pDate(v) {
   }
   const s = kText(v);
   if (!s) return "";
-  let m = s.match(/(20\d{2})[年\/\-\.](\d{1,2})[月\/\-\.](\d{1,2})/);
+  let m = s.match(/(20\d{2})[年\/\-\.](\d{1,2})[月\/\-\.](\d{1,2})日?/);
   if (m) return formatDateIso(m[1], m[2], m[3]);
-  m = s.match(/^(\d{1,2})[月\/\-\.](\d{1,2})$/);
-  if (m) {
+  // 8 位纯数字日期 20261125
+  m = s.match(/^(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$/);
+  if (m) return formatDateIso(m[1], m[2], m[3]);
+  // 2 位年份 26.11.25 / 26-11-25 / 26/11/25
+  m = s.match(/^(\d{2})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})日?$/);
+  if (m && Number(m[1]) >= 20 && Number(m[1]) <= 39 && Number(m[2]) >= 1 && Number(m[2]) <= 12 && Number(m[3]) >= 1 && Number(m[3]) <= 31) {
+    return formatDateIso("20" + m[1], m[2], m[3]);
+  }
+  // 欧美日/月/年格式 25/11/2026
+  m = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](20\d{2})$/);
+  if (m && Number(m[2]) >= 1 && Number(m[2]) <= 12 && Number(m[1]) >= 1 && Number(m[1]) <= 31) {
+    return formatDateIso(m[3], m[2], m[1]);
+  }
+  // 月日格式 11月25日 / 11-25 / 11/25（严禁匹配纯小数如 0.5 / 1.5）
+  m = s.match(/^(\d{1,2})(?:月|[\/\-])(\d{1,2})日?$/);
+  if (m && Number(m[1]) >= 1 && Number(m[1]) <= 12 && Number(m[2]) >= 1 && Number(m[2]) <= 31) {
     const baseYear = (document.getElementById("dateInput")?.value || "").slice(0, 4) || String(new Date().getFullYear());
     return formatDateIso(baseYear, m[1], m[2]);
   }
@@ -1639,7 +1653,7 @@ function detectHeaderAndCols(matrix) {
         temp.person = c; coreUsed.add(c); score += 1;
       } else if (temp.dept < 0 && (main.includes("车间") || main.includes("部门") || main.includes("班组") || main.includes("单位部门"))) {
         temp.dept = c; coreUsed.add(c); score += 1;
-      } else if (temp.date < 0 && (main.includes("日期") || main.includes("时间") || main === "Date")) {
+      } else if (temp.date < 0 && (main.includes("日期") || main.includes("时间") || /^date$/i.test(main))) {
         temp.date = c; coreUsed.add(c); score += 1;
       } else if (main.includes("项目号")) {
         if (temp.project < 0) temp.project = c;
@@ -2289,10 +2303,21 @@ function autoInspectSheet(sheetName) {
   }
 }
 
+function getVisibleSheetNames(wb) {
+  const names = (wb && wb.SheetNames) ? wb.SheetNames : [];
+  const metaSheets = wb?.Workbook?.Sheets || [];
+  const visible = names.filter((name, idx) => {
+    const hidden = metaSheets[idx]?.Hidden;
+    return !hidden; // 0/undefined 为可见，1=隐藏，2=深度隐藏
+  });
+  return visible.length > 0 ? visible : names;
+}
+
 function findBestSheetInWorkbook(wb) {
-  let bestSheet = wb.SheetNames[0] || "";
+  const visibleNames = getVisibleSheetNames(wb);
+  let bestSheet = visibleNames[0] || "";
   let bestScore = -1;
-  wb.SheetNames.forEach(name => {
+  visibleNames.forEach(name => {
     const matrix = sheetToMatrixWithMerges(wb.Sheets[name]);
     const det = detectHeaderAndCols(matrix);
     const sc = (!det.failed ? 10 : 0) + Math.min(matrix.length, 50) / 10;
@@ -2322,7 +2347,9 @@ async function handleMainFileChange(e) {
     sel.innerHTML = "";
 
     if (wbBatchCache.length === 1) {
-      first.wb.SheetNames.forEach(name => {
+      const visibleNames = getVisibleSheetNames(first.wb);
+      const hiddenCount = first.wb.SheetNames.length - visibleNames.length;
+      visibleNames.forEach(name => {
         const opt = document.createElement("option");
         opt.value = name;
         opt.textContent = name;
@@ -2330,7 +2357,7 @@ async function handleMainFileChange(e) {
       });
       sel.value = first.bestSheet;
       autoInspectSheet(first.bestSheet);
-      showToast(`已加载申报单：${first.fileName}（共 ${first.wb.SheetNames.length} 个工作表）`);
+      showToast(`已加载申报单：${first.fileName}（可见 ${visibleNames.length} 个工作表${hiddenCount > 0 ? `，已过滤 ${hiddenCount} 个隐藏表` : ""}）`);
     } else {
       const opt = document.createElement("option");
       opt.value = "__BATCH_AUTO__";
@@ -2384,7 +2411,33 @@ function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existing
   }
 
   const c = det.cols;
-  let carryDate = meta.metaDate || "";
+  // 若表头缺少“日期”列，自动从数据区反推有效日期命中最高的列
+  if (c.date < 0) {
+    const colDateHits = {};
+    const maxScanC = Math.min(25, Math.max(...matrix.slice(det.dataStartRow, det.dataStartRow + 120).map(r => (r || []).length), 0));
+    for (let r = det.dataStartRow; r < Math.min(matrix.length, det.dataStartRow + 200); r++) {
+      const row = matrix[r] || [];
+      for (let ci = 0; ci < maxScanC; ci++) {
+        if (ci === c.code || ci === c.name || ci === c.qty || ci === c.unit) continue;
+        if (pDate(row[ci])) colDateHits[ci] = (colDateHits[ci] || 0) + 1;
+      }
+    }
+    let bestDateCol = -1, bestHits = 0;
+    for (const [ci, hits] of Object.entries(colDateHits)) {
+      if (hits > bestHits) { bestHits = hits; bestDateCol = Number(ci); }
+    }
+    if (bestDateCol >= 0 && bestHits >= 1) c.date = bestDateCol;
+  }
+
+  // 确认表内是否存在有效日期列数据（存在时严禁放行无日期行）
+  let hasAnyDateInCol = false;
+  if (c.date >= 0) {
+    for (let r = det.dataStartRow; r < matrix.length; r++) {
+      if (pDate((matrix[r] || [])[c.date])) { hasAnyDateInCol = true; break; }
+    }
+  }
+
+  let carryDate = hasAnyDateInCol ? "" : (meta.metaDate || "");
   let carryPerson = meta.metaPerson || "";
   let carryDept = "";
 
@@ -2392,6 +2445,11 @@ function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existing
   const matchedEntries = [];
   for (let r = det.dataStartRow; r < matrix.length; r++) {
     const row = matrix[r] || [];
+    const isCompletelyBlank = row.every(cell => !kText(cell));
+    if (isCompletelyBlank) {
+      if (hasAnyDateInCol) carryDate = "";
+      continue;
+    }
 
     const firstCellText = kText(row[0]);
     if (/^(领料要求|注意事项|填写说明|备注说明)$/.test(firstCellText)) {
@@ -2400,10 +2458,14 @@ function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existing
     }
 
     if (c.date >= 0) {
+      const rawDateText = kText(row[c.date]);
       const rd = pDate(row[c.date]);
       if (rd) {
         carryDate = rd;
         state.foundDates.add(rd);
+      } else if (rawDateText && !/^\d{1,3}$/.test(rawDateText)) {
+        // 遇到非日期文字分隔行时重置 carryDate
+        carryDate = "";
       }
     }
     if (c.person >= 0) {
@@ -2420,8 +2482,9 @@ function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existing
     if (!code && !name) continue;
     if (/^(合计|总计|小计|制表|审核|批准|备注|领料人|序号)$/.test(name) || /^(合计|总计|小计)$/.test(code)) continue;
 
-    const rowDate = carryDate || meta.metaDate;
+    const rowDate = carryDate || (hasAnyDateInCol ? "" : meta.metaDate);
     if (rowDate) state.foundDates.add(rowDate);
+    if (hasAnyDateInCol && !rowDate) continue;
     if (rowDate && rowDate !== targetDate) continue;
 
     const rawDeptCell = c.dept >= 0 ? kText(row[c.dept]) : "";
@@ -2556,6 +2619,11 @@ function auditSingleSheet(ws, sheetName, fName, targetDate, manualDept, existing
     const qtyCellVal = lockedQtyCol >= 0 ? row[lockedQtyCol] : "";
     const qtyParsed = parseQtyValue(qtyCellVal);
     const qtyRaw = qtyParsed !== null ? formatQtyNum(qtyParsed) : kText(qtyCellVal);
+    // 若已锁定有效数量列且目标日期存在正数行，自动过滤未申领（数量为空或 <= 0）的模板行
+    if (lockedQtyCol >= 0 && lockedHits > 0 && (qtyParsed === null || qtyParsed <= 0)) {
+      state.zeroQtySkipped = (state.zeroQtySkipped || 0) + 1;
+      continue;
+    }
     if (!qtyRaw && !code) continue;
 
     // 全列扫描「自取/自提/补单/补领/补开/已领取」
@@ -2667,6 +2735,7 @@ function runAudit() {
     unknownPersons: new Map(),
     dupSkipped: 0,
     excludedSkipped: 0,
+    zeroQtySkipped: 0,
     anyHeaderless: false,
     filesProcessed: 0,
     qtyLockNotes: []
@@ -2725,7 +2794,7 @@ function runAudit() {
   const qtyLockHtml = (state.qtyLockNotes && state.qtyLockNotes.length)
     ? ` <span class="text-blue-700 font-semibold">[锁定数量列: ${escapeHtml(state.qtyLockNotes.slice(0, 4).join(" / "))}]</span>`
     : "";
-  setStatusBox("ok", `✅ 核算完成${modeNote}！本次放行 <b>${candidates.length}</b> 条有效领料行（含自动插入组间空行，共渲染 ${workRows.length} 行）并已实时归档至历史底表总账。${qtyLockHtml}${dupSkipped > 0 ? ` 已自动拦截重复 ${dupSkipped} 条。` : ""}${excludedSkipped > 0 ? ` 已过滤非 HJF/王雷 ${excludedSkipped} 条。` : ""}${pgHitCount > 0 ? ` 命中 P3/GD1 库存 ${pgHitCount} 条。` : ""}${alertHtml}`);
+  setStatusBox("ok", `✅ 核算完成${modeNote}！本次放行 <b>${candidates.length}</b> 条有效领料行（含自动插入组间空行，共渲染 ${workRows.length} 行）并已实时归档至历史底表总账。${qtyLockHtml}${state.zeroQtySkipped > 0 ? ` 已过滤空/0数量模板行 ${state.zeroQtySkipped} 条。` : ""}${dupSkipped > 0 ? ` 已自动拦截重复 ${dupSkipped} 条。` : ""}${excludedSkipped > 0 ? ` 已过滤非 HJF/王雷 ${excludedSkipped} 条。` : ""}${pgHitCount > 0 ? ` 命中 P3/GD1 库存 ${pgHitCount} 条。` : ""}${alertHtml}`);
 }
 
 // =========================================================================
