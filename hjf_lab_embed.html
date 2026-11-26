@@ -172,6 +172,7 @@
         <button onclick="deleteSelectedWorkRows()" class="h-8 px-3 bg-rose-100 hover:bg-rose-200 text-rose-800 font-semibold rounded-lg">- 删除选中行</button>
         <button onclick="selectAllGrid('work')" class="h-8 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg">全选表格</button>
         <button onclick="togglePanMode()" class="pan-mode-btn h-8 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 font-semibold rounded-lg">🖱️ Excel 选格模式</button>
+        <button onclick="openProcurementModal()" class="h-8 px-3 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-lg shadow-sm">📸 综合/配件仓请购询问图</button>
       </div>
       <div class="text-slate-500">提示：<b>左键拖动</b>顺滑框选（到边缘自动滚动）；<b>右下角蓝点</b>拖拽填充；<b>单击行号/表头</b>选整行整列；<b>直接打字/双击</b>编辑；<b>Ctrl+C/V</b>复制粘贴；<b>空格/Ctrl+拖动</b>平移</div>
     </div>
@@ -3537,6 +3538,234 @@ async function bootApp() {
     hb.className = "bg-emerald-500/30 border border-emerald-200/50 px-3 py-1 rounded-full font-medium";
   }
 }
+
+// =========================================================================
+// 13. 综合仓 / 配件仓一键生成请购询问高清表格图（纯前端 Canvas，直接 Ctrl+V 发群）
+// =========================================================================
+let procItemsCache = [];
+
+function ensureProcurementModalDom() {
+  if (document.getElementById("procInquiryModal")) return;
+  const wrap = document.createElement("div");
+  wrap.id = "procInquiryModal";
+  wrap.className = "hidden fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-3 sm:p-6";
+  wrap.innerHTML = `
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[92vh] flex flex-col overflow-hidden">
+      <div class="px-5 py-3.5 bg-amber-600 text-white flex items-center justify-between">
+        <div>
+          <h3 class="font-bold text-sm sm:text-base">📸 综合仓 / 配件仓 — 请购部一键询问图</h3>
+          <p class="text-[11px] text-amber-100">自动筛选综合仓与配件仓申报物资，纯前端生成高清无截断表格图，点「复制图片」即可在微信/钉钉直接 Ctrl+V 发送</p>
+        </div>
+        <button onclick="closeProcurementModal()" class="px-2.5 py-1 bg-white/20 hover:bg-white/30 rounded-lg text-xs font-bold">✕ 关闭</button>
+      </div>
+      <div class="p-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs bg-slate-50">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="font-semibold text-slate-700">筛选仓库：</span>
+          <select id="procWhFilter" onchange="renderProcurementPreview()" class="h-8 px-2.5 border border-slate-300 rounded-lg bg-white text-slate-800">
+            <option value="ALL">综合仓 + 配件仓（合并）</option>
+            <option value="综合仓">仅综合仓</option>
+            <option value="配件仓">仅配件仓</option>
+          </select>
+          <span id="procCountBadge" class="px-2.5 py-1 bg-amber-100 text-amber-900 rounded-full font-bold">0 条</span>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <button onclick="copyProcurementImage()" class="h-8 px-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg shadow-sm">📋 复制高清图片（Ctrl+V发群）</button>
+          <button onclick="copyProcurementText()" class="h-8 px-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg">💬 复制询问话术</button>
+          <button onclick="downloadProcurementImage()" class="h-8 px-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg">📥 下载 PNG</button>
+        </div>
+      </div>
+      <div class="p-4 overflow-auto flex-1 space-y-3">
+        <div id="procCheckList" class="flex flex-wrap gap-1.5 text-[11px]"></div>
+        <div class="border border-slate-200 rounded-xl p-2 bg-slate-100 overflow-auto text-center">
+          <canvas id="procCanvas" class="mx-auto shadow bg-white max-w-full"></canvas>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+}
+
+function openProcurementModal() {
+  ensureProcurementModalDom();
+  const realRows = (workRows || []).filter(r => r && !r._isBlank);
+  const filtered = realRows.filter(r => /(综合仓|配件仓)/.test(String(r.warehouse || "")));
+  if (!filtered.length) {
+    return showToast("当前工作台结果中没有「综合仓」或「配件仓」物资");
+  }
+  procItemsCache = filtered.map((r, idx) => ({ idx, checked: true, row: r }));
+  document.getElementById("procInquiryModal").classList.remove("hidden");
+  renderProcurementPreview();
+}
+window.openProcurementModal = openProcurementModal;
+
+function closeProcurementModal() {
+  document.getElementById("procInquiryModal")?.classList.add("hidden");
+}
+window.closeProcurementModal = closeProcurementModal;
+
+function toggleProcItem(idx) {
+  const it = procItemsCache.find(x => x.idx === idx);
+  if (it) it.checked = !it.checked;
+  renderProcurementPreview();
+}
+window.toggleProcItem = toggleProcItem;
+
+function getActiveProcRows() {
+  const f = document.getElementById("procWhFilter")?.value || "ALL";
+  return procItemsCache.filter(it => {
+    if (!it.checked) return false;
+    const wh = String(it.row.warehouse || "");
+    if (f === "综合仓") return wh.includes("综合仓");
+    if (f === "配件仓") return wh.includes("配件仓");
+    return true;
+  }).map(it => it.row);
+}
+
+function renderProcurementPreview() {
+  const f = document.getElementById("procWhFilter")?.value || "ALL";
+  const listEl = document.getElementById("procCheckList");
+  const eligible = procItemsCache.filter(it => f === "ALL" || String(it.row.warehouse || "").includes(f));
+  listEl.innerHTML = eligible.map(it => `
+    <label class="inline-flex items-center gap-1 px-2 py-1 rounded-lg border cursor-pointer ${it.checked ? "bg-amber-50 border-amber-300 text-amber-900" : "bg-slate-50 border-slate-200 text-slate-400 line-through"}">
+      <input type="checkbox" ${it.checked ? "checked" : ""} onchange="toggleProcItem(${it.idx})" class="accent-amber-600" />
+      <span>${escapeHtml(it.row.dept)} · ${escapeHtml(String(it.row.name || "").slice(0, 14))} (${escapeHtml(it.row.qty)}${escapeHtml(it.row.unit)})</span>
+    </label>
+  `).join("");
+
+  const rows = getActiveProcRows();
+  const badge = document.getElementById("procCountBadge");
+  if (badge) badge.textContent = `${rows.length} 条`;
+
+  const canvas = document.getElementById("procCanvas");
+  if (!canvas) return;
+  const dpr = 2;
+  const cols = [
+    { key: "_no", title: "序号", w: 48, align: "center" },
+    { key: "dept", title: "车间/部门", w: 110, align: "left" },
+    { key: "warehouse", title: "仓库", w: 96, align: "center" },
+    { key: "code", title: "物料编码", w: 120, align: "center" },
+    { key: "name", title: "物资名称及规格", w: 300, align: "left" },
+    { key: "qty", title: "数量", w: 72, align: "right" },
+    { key: "unit", title: "单位", w: 54, align: "center" },
+    { key: "remark", title: "用途/备注", w: 210, align: "left" }
+  ];
+  const padX = 20, titleH = 56, headH = 36, rowH = 34, footH = 34;
+  const tableW = cols.reduce((s, c) => s + c.w, 0);
+  const W = tableW + padX * 2;
+  const H = titleH + headH + Math.max(1, rows.length) * rowH + footH + 16;
+
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, W, H);
+
+  const bizDate = (rows[0]?.date) || document.getElementById("dateInput")?.value || "";
+  const whLabel = f === "ALL" ? "综合仓 / 配件仓" : f;
+  ctx.fillStyle = "#1e3a8a";
+  ctx.font = "bold 18px 'Microsoft YaHei', sans-serif";
+  ctx.fillText(`HJF ${whLabel} 领料请购确认清单（${bizDate} · 共 ${rows.length} 项）`, padX, 34);
+
+  let y = titleH;
+  ctx.fillStyle = "#1e293b";
+  ctx.fillRect(padX, y, tableW, headH);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 13px 'Microsoft YaHei', sans-serif";
+  let x = padX;
+  for (const col of cols) {
+    ctx.fillText(col.title, x + 8, y + 23);
+    x += col.w;
+  }
+  y += headH;
+
+  const fitText = (text, maxW) => {
+    const s = String(text ?? "");
+    if (ctx.measureText(s).width <= maxW) return s;
+    let out = s;
+    while (out.length > 1 && ctx.measureText(out + "…").width > maxW) out = out.slice(0, -1);
+    return out + "…";
+  };
+
+  ctx.font = "12.5px 'Microsoft YaHei', sans-serif";
+  if (rows.length === 0) {
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText("（未勾选任何行）", padX + 16, y + 22);
+    y += rowH;
+  } else {
+    rows.forEach((r, idx) => {
+      ctx.fillStyle = idx % 2 === 0 ? "#ffffff" : "#f8fafc";
+      ctx.fillRect(padX, y, tableW, rowH);
+      ctx.strokeStyle = "#e2e8f0";
+      ctx.strokeRect(padX, y, tableW, rowH);
+      let cx = padX;
+      for (const col of cols) {
+        const val = col.key === "_no" ? String(idx + 1) : String(r[col.key] ?? "");
+        ctx.fillStyle = col.key === "qty" ? "#b91c1c" : (col.key === "warehouse" ? "#1d4ed8" : "#0f172a");
+        ctx.font = (col.key === "qty" || col.key === "code") ? "bold 12.5px 'Microsoft YaHei', sans-serif" : "12.5px 'Microsoft YaHei', sans-serif";
+        const txt = fitText(val, col.w - 14);
+        ctx.fillText(txt, cx + 7, y + 22);
+        ctx.beginPath();
+        ctx.moveTo(cx + col.w, y);
+        ctx.lineTo(cx + col.w, y + rowH);
+        ctx.strokeStyle = "#e2e8f0";
+        ctx.stroke();
+        cx += col.w;
+      }
+      y += rowH;
+    });
+  }
+
+  ctx.fillStyle = "#475569";
+  ctx.font = "12px 'Microsoft YaHei', sans-serif";
+  ctx.fillText("请购部老师好：麻烦核实以上申报物资是否提供，谢谢！", padX, y + 24);
+}
+
+async function copyProcurementImage() {
+  const canvas = document.getElementById("procCanvas");
+  if (!canvas) return;
+  try {
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+    if (navigator.clipboard && window.ClipboardItem) {
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      showToast("✅ 高清表格图已复制到剪贴板！切到微信/钉钉按 Ctrl+V 直接发送");
+    } else {
+      downloadProcurementImage();
+      showToast("当前浏览器不支持直接复制图片，已自动为你下载 PNG");
+    }
+  } catch (err) {
+    console.error(err);
+    downloadProcurementImage();
+    showToast("剪贴板权限受限，已自动下载 PNG 图片");
+  }
+}
+window.copyProcurementImage = copyProcurementImage;
+
+function copyProcurementText() {
+  const rows = getActiveProcRows();
+  if (!rows.length) return showToast("请至少勾选 1 条物资");
+  const bizDate = rows[0].date || document.getElementById("dateInput")?.value || "";
+  const lines = [`请购部老师好，麻烦核实一下 ${bizDate} 以下综合仓/配件仓申报物资是否提供，谢谢！`];
+  rows.forEach((r, i) => {
+    lines.push(`${i + 1}. [${r.warehouse}] ${r.dept} | ${r.code} | ${r.name} | ${r.qty}${r.unit}${r.remark ? `（${r.remark}）` : ""}`);
+  });
+  navigator.clipboard?.writeText(lines.join("\n")).then(() => showToast("✅ 已复制询问话术，可直接粘贴发送"));
+}
+window.copyProcurementText = copyProcurementText;
+
+function downloadProcurementImage() {
+  const canvas = document.getElementById("procCanvas");
+  if (!canvas) return;
+  const bizDate = document.getElementById("dateInput")?.value || "today";
+  const a = document.createElement("a");
+  a.href = canvas.toDataURL("image/png");
+  a.download = `HJF请购确认_${bizDate}.png`;
+  a.click();
+}
+window.downloadProcurementImage = downloadProcurementImage;
 
 window.addEventListener("DOMContentLoaded", bootApp);
 </script>
