@@ -108,7 +108,12 @@
     const iCode = fh.findIndex(h => /物料编码|存货编码|物资编码/.test(h));
     const iQty = fh.findIndex(h => /实发数量|出库主数量|出库数量|数量/.test(h));
     const iDate = fh.findIndex(h => /日期/.test(h));
-    const iName = fh.findIndex(h => /名称/.test(h));
+    const iName = fh.findIndex(h => /物料名称|存货名称|物资名称/.test(h)) >= 0
+      ? fh.findIndex(h => /物料名称|存货名称|物资名称/.test(h))
+      : fh.findIndex(h => /名称/.test(h) && !/仓库|部门|组织/.test(h));
+    const iUnit = fh.findIndex(h => /^(主单位|主计量单位|计量单位|单位)$/.test(h)) >= 0
+      ? fh.findIndex(h => /^(主单位|主计量单位|计量单位|单位)$/.test(h))
+      : fh.findIndex(h => /单位/.test(h) && !/领用单位|组织/.test(h));
     if (iCode < 0 || iQty < 0) throw new Error('流水账未找到物料编码或数量列');
 
     const colTitle = state.periodLabel.trim() || `本期出库数量`;
@@ -127,20 +132,28 @@
       flowByWhCode.set(key, (flowByWhCode.get(key) || 0) + qty);
       rawFlowEntries.push({
         key,
-        row: [iDate >= 0 ? U.formatDate(r[iDate]) : '', wh, code, iName >= 0 ? U.cleanStr(r[iName]) : '', qty]
+        date: iDate >= 0 ? U.formatDate(r[iDate]) : '',
+        wh,
+        code,
+        name: iName >= 0 ? U.cleanStr(r[iName]) : '',
+        unit: iUnit >= 0 ? U.cleanStr(r[iUnit]) : '',
+        qty
       });
     }
 
+    // 收集底表同编码的默认主单位（流水缺少单位时自动兜底补全）
+    const baseUnitByCode = new Map();
     let matched = 0;
     const matchedFlowKeys = new Set();
     state.sheetNames.forEach(sn => {
       if (sn.includes('消耗') || sn.includes('统计')) return;
       const sh = state.baseSheets[sn];
       const { codeCol, baseCol, histCols } = detectCols(sh.headers);
+      const unitCol = sh.headers.findIndex(h => /主单位|单位/.test(h));
       sh.headers.push(colTitle);
       const newColIdx = sh.headers.length - 1;
 
-      // 按编码分组，优先扣减前轮有活动记录的行，兼容红字退库（负数量）
+      // 按编码分组，优先扣减前轮有活动记录的行，退库直接按负数冲减
       const groups = new Map();
       sh.rows.forEach((row, rIdx) => {
         while (row.length < sh.headers.length) row.push('');
@@ -149,6 +162,9 @@
         const code = U.formatCode(rawCode, true);
         row[codeCol] = code;
         if (!code) return;
+        if (unitCol >= 0 && U.cleanStr(row[unitCol]) && !baseUnitByCode.has(code)) {
+          baseUnitByCode.set(code, U.cleanStr(row[unitCol]));
+        }
         if (!groups.has(code)) groups.set(code, []);
         groups.get(code).push(rIdx);
       });
@@ -186,44 +202,92 @@
             sh.rows[rIdx][newColIdx] = after <= 1e-9 ? `出库${U.fmtNum(take)}，全部出库` : `出库${U.fmtNum(take)}，剩余${U.fmtNum(after)}`;
             remainDelta -= take;
           } else {
-            // 红字退库冲减（允许对已“全部出库”行回冲）
+            // 红字退库冲减：直接写出负数，不另写退库记录
             const refund = Math.abs(remainDelta);
             const after = baseRem + refund;
-            sh.rows[rIdx][newColIdx] = `退库${U.fmtNum(refund)}，剩余${U.fmtNum(after)}`;
+            sh.rows[rIdx][newColIdx] = `出库-${U.fmtNum(refund)}，剩余${U.fmtNum(after)}`;
             remainDelta = 0;
           }
         }
       });
     });
 
-    const consumeLog = rawFlowEntries.filter(e => matchedFlowKeys.has(e.key)).map(e => e.row);
+    // 探测原「呆滞物资消耗量统计」表末尾最大序号与默认姓名（如图中 266 / 刘凯）
+    let nextSeq = 1;
+    let defaultPerson = '刘凯';
+    const statSn = state.sheetNames.find(sn => sn.includes('消耗') || sn.includes('统计'));
+    if (statSn && state.baseSheets[statSn]) {
+      const statRows = state.baseSheets[statSn].rows || [];
+      for (let i = statRows.length - 1; i >= 0; i--) {
+        const seqNum = parseInt(U.cleanStr(statRows[i][0]), 10);
+        if (!isNaN(seqNum) && seqNum >= nextSeq) {
+          nextSeq = seqNum + 1;
+          if (U.cleanStr(statRows[i][2])) defaultPerson = U.cleanStr(statRows[i][2]);
+          break;
+        }
+      }
+    }
+
+    // 严格按标准 9 列格式生成消耗量统计：序号 | 日期 | 姓名 | 公司(固定HJF) | 物资编码 | 物资名称 | 单位 | 消耗数量(退库为负数) | 备注
+    const consumeLog = rawFlowEntries
+      .filter(e => matchedFlowKeys.has(e.key))
+      .map(e => {
+        const unit = e.unit || baseUnitByCode.get(e.code) || '';
+        const numQty = Math.round(e.qty * 1e6) / 1e6; // 正数出库，负数退库
+        return [
+          nextSeq++,
+          e.date,
+          defaultPerson,
+          'HJF',
+          e.code,
+          e.name,
+          unit,
+          numQty,
+          ''
+        ];
+      });
+
+    // 若底表存在「呆滞物资消耗量统计」，同步顺延追加到该表末尾
+    if (statSn && state.baseSheets[statSn] && consumeLog.length) {
+      const shStat = state.baseSheets[statSn];
+      consumeLog.forEach(r => shStat.rows.push(r.map(v => (v === null || v === undefined ? '' : String(v)))));
+    }
+
     state.flowCount = flowCount;
     state.matchedCount = matched;
     state.consumeLog = consumeLog;
     persistState();
-    U.toast(`核扣完成：流水 ${flowCount} 笔，命中呆滞品 ${matched} 项（已新增列：${colTitle}）`, 'success');
+    U.toast(`核扣完成：流水 ${flowCount} 笔，命中呆滞品 ${matched} 项（已按 9 列标准格式生成消耗量统计，公司固定 HJF）`, 'success');
   }
 
+  const CONSUME_HEADERS_9 = ['序号', '日期', '姓名', '公司', '物资编码', '物资名称', '单位', '消耗数量', '备注'];
+
   function renderModule(root) {
-    const cur = state.baseSheets[state.activeSheet];
+    const isConsumeView = state.activeSheet === '__CONSUME__';
+    const cur = isConsumeView
+      ? { headers: CONSUME_HEADERS_9, rows: state.consumeLog }
+      : state.baseSheets[state.activeSheet];
+
     root.innerHTML = `
       <div class="panel">
         <div class="panel-title">
-          <span>🧱 呆滞品多轮核扣（分页防卡死 · 11位前导0强保 · 红字退库冲减）</span>
+          <span>🧱 呆滞品多轮核扣（分页防卡死 · 11位前导0强保 · 公司固定HJF · 退库写负数）</span>
           <span class="pill pill-blue">${state.sheetNames.length ? '已加载 ' + state.sheetNames.length + ' 个工作表' : '待导入底表'}</span>
         </div>
         <div class="kpi-grid">
           <div class="kpi-card blue"><div class="kpi-label">当前工作表行数</div><div class="kpi-val">${cur ? cur.rows.length : 0}</div></div>
           <div class="kpi-card"><div class="kpi-label">本期导入流水笔数</div><div class="kpi-val">${state.flowCount}</div></div>
           <div class="kpi-card green"><div class="kpi-label">命中核扣编码数</div><div class="kpi-val">${state.matchedCount}</div></div>
+          <div class="kpi-card orange"><div class="kpi-label">本期消耗量统计条数</div><div class="kpi-val">${state.consumeLog.length}</div></div>
         </div>
         <div class="toolbar">
           <button class="btn btn-primary" id="s-up-base">📂 1. 导入上一轮呆滞品底表</button>
           <input type="file" id="s-in-base" accept=".xlsx,.xls" class="hidden-input" />
-          <input type="text" id="s-period" value="${U.escHtml(state.periodLabel)}" placeholder="新列名，如：11.15-11.22出库数量" style="width:210px;" />
+          <input type="text" id="s-period" value="${U.escHtml(state.periodLabel)}" placeholder="新列名，如：11.20-11.26出库数量" style="width:210px;" />
           <button class="btn btn-warning" id="s-up-flow">📥 2. 导入本期出入库流水账</button>
           <input type="file" id="s-in-flow" accept=".xlsx,.xls,.csv" class="hidden-input" />
           <span style="flex:1"></span>
+          <button class="btn" id="s-copy-consume" ${!state.consumeLog.length ? 'disabled' : ''}>📋 一键复制本期消耗量 (9列)</button>
           <button class="btn btn-success" id="s-exp" ${!state.sheetNames.length ? 'disabled' : ''}>💾 导出核扣后总表 (.xlsx)</button>
         </div>
       </div>
@@ -231,6 +295,7 @@
       <div class="panel">
         <div class="toolbar">
           ${state.sheetNames.map(sn => `<button class="btn ${sn === state.activeSheet ? 'btn-primary' : ''}" data-sn="${U.escHtml(sn)}">${U.escHtml(sn)}</button>`).join('')}
+          ${state.consumeLog.length ? `<button class="btn ${isConsumeView ? 'btn-primary' : ''}" data-sn="__CONSUME__">📊 本期消耗量统计 (${state.consumeLog.length})</button>` : ''}
         </div>
         <div id="s-table-box"></div>
       </div>
@@ -255,14 +320,29 @@
       btn.onclick = () => { state.activeSheet = btn.dataset.sn; state.page = 1; renderModule(root); };
     });
 
+    root.querySelector('#s-copy-consume').onclick = async () => {
+      const ok = await U.copyAsTSV(CONSUME_HEADERS_9, state.consumeLog, false);
+      U.toast(ok ? `已复制 ${state.consumeLog.length} 行标准 9 列消耗量（含单位、固定HJF、退库负数）` : '复制失败', ok ? 'success' : 'error');
+    };
+
     root.querySelector('#s-exp').onclick = () => {
       const cfgs = state.sheetNames.map(sn => {
         const sh = state.baseSheets[sn];
+        if (sn.includes('消耗') || sn.includes('统计')) {
+          return { name: sn, headers: sh.headers, rows: sh.rows, textCols: [1, 4], numCols: [0, 7] };
+        }
         const { codeCol } = detectCols(sh.headers);
         return { name: sn, headers: sh.headers, rows: sh.rows, textCols: [codeCol] };
       });
       if (state.consumeLog.length) {
-        cfgs.push({ name: '本期消耗量统计', headers: ['日期', '仓库', '物料编码', '物料名称', '出库/退库数量'], rows: state.consumeLog, textCols: [2], numCols: [4] });
+        cfgs.push({
+          name: '本期消耗量统计',
+          headers: CONSUME_HEADERS_9,
+          rows: state.consumeLog,
+          textCols: [1, 4],
+          numCols: [0, 7],
+          colWidths: [8, 12, 10, 8, 15, 28, 8, 12, 16]
+        });
       }
       U.exportWorkbook(cfgs, `呆滞品核扣结果.xlsx`);
       U.toast('已导出呆滞品核扣结果.xlsx', 'success');
@@ -275,9 +355,10 @@
         page: state.page,
         pageSize: 100,
         rowClassFn: r => {
-          const last = r[r.length - 1] || '';
+          if (isConsumeView) return Number(r[7]) < 0 ? 'row-err' : '';
+          const last = String(r[r.length - 1] || '');
           if (last.includes('全部出库')) return 'row-ok';
-          if (last.includes('剩余') || last.includes('退库')) return 'row-warn';
+          if (last.includes('剩余') || last.includes('出库-')) return 'row-warn';
           return '';
         },
         onPageChange: pg => { state.page = pg; renderModule(root); }
