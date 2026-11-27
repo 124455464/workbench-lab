@@ -1,22 +1,19 @@
 /**
- * 模块 3：出库扫描 PDF 自动核对工作台（纯 PDF 版 · 平台自动检索核销，人工只核对未检索单据）
- * 核心能力：
- * 1. 双格式出库单自动拆票：
- *    - ERP《材料出库单列表》（无空行、带单据号）-> 自动定位真实表头，按「单据号」拆分为独立单据卡片
- *    - HJF 14列 / 总账（按空行分票）-> 自动识别日期列偏移，按空行拆分为独立单据卡片
- *    - 强制剔除含丁烷气罐在内的全部气体
- * 2. 平台后台自动核对扫描 PDF（文本层毫秒扫 + 双核复用 OCR 后台跑，切标签不中断）：
- *    - 自动从 PDF 每页提取单据号（CCHF/CK）与 10/11 位物料编码
- *    - 自动匹配并核销右侧对应单据，标注匹配页码（点击一键跳转该页复查）
- * 3. 核对区默认聚焦「🔴 待人工核对（平台未检索到）」，左侧支持「仅看未匹配PDF页」，每张单据独立点击核销。
+ * 模块 3：HJF 出库扫描 PDF 自动核对（直连 HJF「历史出库底表总账」· 按日期/日期区间精准锁定核对）
+ * 核心口径：
+ * 1. 彻底独立于【16列精简与自取】，直接对接【HJF 出库核算 -> 2. 历史出库底表（总账可编辑）】（自动直读同源 IndexedDB，亦支持手动导入《HJF物资出库总账.xlsx》）。
+ * 2. 严格按日期区间锁定范围（支持单日如 27 号，或区间如 27~28 号；导入 PDF 时亦自动识别单据日期/文件名日期锁定范围，绝不串核其他日期）。
+ * 3. 自动剔除含丁烷气罐在内的全部气体；平台后台双核 OCR 自动按物料编码/日期核销，人工只需复核「未检索到」的单据。
  */
 (function () {
   'use strict';
   const U = WB.Utils;
-  const SCHEMA_VER = 2;
+  const SCHEMA_VER = 3;
+  const HJF_IDB_NAME = 'HJF_Ledger_DB_v292';
+  const HJF_MASTER_KEY = 'hjf_master_records_v292';
+
   const GAS_KEYWORDS = ['氧气', '乙炔', '二氧化碳', '氩气', '氮气', '丙烷', '液化气', '混合气', '丁烷气', '丁烷'];
   const DOC_REGEX = /(?:CCHF|CK)\d{10,22}/gi;
-  // 兼容扫描件常见 OCR 误识（如 C->G/O, H->N, F->E/P, 0->O, 1->I/L）
   const FUZZY_DOC_REGEX = /(?:[CGOQ0]{2}[HN][FEP]|C[KH])\s*[0-9OIL]{10,22}/gi;
   const CODE_REGEX = /\b0[356789]\d{8,9}\b/g;
 
@@ -37,22 +34,91 @@
     return Array.from(out);
   }
 
+  function extractDatesFromPage(rawText, docs) {
+    const out = new Set();
+    // 1. 从 CCHF20261127... 单号提取精确日期
+    (docs || []).forEach(d => {
+      const m = d.match(/(?:CCHF|CK)(20\d{2})(\d{2})(\d{2})/);
+      if (m) out.add(`${m[1]}-${m[2]}-${m[3]}`);
+    });
+    // 2. 从正文提取 2026-11-27
+    (String(rawText || '').match(/20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}/g) || []).forEach(s => {
+      const norm = U.formatDate(s);
+      if (/^20\d{2}-\d{2}-\d{2}$/.test(norm)) out.add(norm);
+    });
+    return Array.from(out).sort();
+  }
+
+  /** 从 PDF 文件名智能解析日期范围（如 "11.27.pdf" / "11.27-11.28.pdf" / "11.27-28.pdf" / "27-28日.pdf" / "27号.pdf" / "2026-11-27.pdf"） */
+  function detectDateRangeFromFileNames(fileNames, availDates) {
+    if (!availDates || !availDates.length) return null;
+    const latestYear = availDates[0].slice(0, 4);
+    const latestMonth = availDates[0].slice(5, 7);
+    const hits = new Set();
+    const tryAdd = (y, m, d) => {
+      const cand = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      if (availDates.includes(cand)) hits.add(cand);
+    };
+
+    for (const fn of fileNames) {
+      // 1. 匹配 YYYY-MM-DD / YYYY.MM.DD
+      (fn.match(/20\d{2}[.\-_]\d{1,2}[.\-_]\d{1,2}/g) || []).forEach(s => {
+        const d = U.formatDate(s);
+        if (availDates.includes(d)) hits.add(d);
+      });
+      // 2. 匹配 MM.DD-DD 或 M月D-D日（同月区间）
+      const sameMonthRange = fn.match(/(\d{1,2})[.\-_月](\d{1,2})\s*[-~至到]\s*(\d{1,2})(?=[日号\D]|$)/g) || [];
+      sameMonthRange.forEach(tok => {
+        const m = tok.match(/(\d{1,2})[.\-_月](\d{1,2})\s*[-~至到]\s*(\d{1,2})/);
+        if (m) {
+          tryAdd(latestYear, m[1], m[2]);
+          tryAdd(latestYear, m[1], m[3]);
+        }
+      });
+      // 3. 匹配 MM.DD / M月D日
+      const mdMatches = fn.match(/(?:^|[^\d])(\d{1,2})[.\-_月](\d{1,2})(?=[日号\D]|$)/g) || [];
+      mdMatches.forEach(tok => {
+        const m = tok.match(/(\d{1,2})[.\-_月](\d{1,2})/);
+        if (m) tryAdd(latestYear, m[1], m[2]);
+      });
+      // 4. 兜底：若前面未命中，匹配纯日区间如 "27-28日" / "27~28号" 或单日 "27号" / "27日"
+      if (hits.size === 0) {
+        const dRange = fn.match(/(?:^|[^\d])(\d{1,2})\s*[-~至到]\s*(\d{1,2})\s*[日号]/g) || [];
+        dRange.forEach(tok => {
+          const m = tok.match(/(\d{1,2})\s*[-~至到]\s*(\d{1,2})/);
+          if (m) {
+            tryAdd(latestYear, latestMonth, m[1]);
+            tryAdd(latestYear, latestMonth, m[2]);
+          }
+        });
+        const dSingle = fn.match(/(?:^|[^\d])(\d{1,2})\s*[日号]/g) || [];
+        dSingle.forEach(tok => {
+          const m = tok.match(/(\d{1,2})/);
+          if (m) tryAdd(latestYear, latestMonth, m[1]);
+        });
+      }
+    }
+    const sorted = Array.from(hits).sort();
+    if (!sorted.length) return null;
+    return { start: sorted[0], end: sorted[sorted.length - 1] };
+  }
+
   let activeRoot = null;
   let ocrWorkers = null;
 
   let state = {
-    tickets: [],          // [{ id, docNo, shortDoc, date, dept, rec, wh, tag, items: [{code,name,qty,unit}], checked, matchType: ''|'auto'|'manual', matchedPage: 0 }]
-    availDates: [],
-    targetDate: '',
-    sheetName: '',
-    sourceName: '',
-    parseMode: '',        // 'erp_doc' | 'blank_block'
-    pdfPages: [],         // [{ pageNum, fileName, url, docs: [], codes: [], matchedTicketIds: [] }]
+    tickets: [],          // [{ id, key, date, dept, rec, wh, tag, items: [{code,name,qty,unit}], checked, matchType: ''|'auto'|'manual', matchedPage: 0, matchedDoc: '' }]
+    availDates: [],       // 降序排列的 HJF 业务日期列表
+    startDate: '',        // 核对起始日期（YYYY-MM-DD）
+    endDate: '',          // 核对结束日期（YYYY-MM-DD）
+    sourceLabel: '',      // 数据来源（直连 HJF 历史底表总账 / 手动导入总账文件）
+    pdfPages: [],         // [{ pageNum, fileName, url, docs: [], codes: [], dates: [], matchedTicketIds: [] }]
     activePageIdx: 0,
     onlyUnmatchedPages: false,
-    auditFilter: 'unmatched', // 'unmatched' | 'auto' | 'all'
+    auditFilter: 'unmatched', // 'unmatched' | 'done' | 'all'
     scanning: false,
     scanLog: '',
+    manualFileLoaded: false,
     _hydrated: false
   };
 
@@ -78,10 +144,9 @@
       schemaVer: SCHEMA_VER,
       tickets: state.tickets,
       availDates: state.availDates,
-      targetDate: state.targetDate,
-      sheetName: state.sheetName,
-      sourceName: state.sourceName,
-      parseMode: state.parseMode,
+      startDate: state.startDate,
+      endDate: state.endDate,
+      sourceLabel: state.sourceLabel,
       auditFilter: state.auditFilter,
       scanLog: state.scanLog
     });
@@ -90,257 +155,286 @@
   async function hydrateState() {
     if (state.scanning || state._hydrated) return;
     const saved = await WB.Store.load('mod_photo_check');
-    // 自动丢弃旧版 v1 错误缓存（避免出现旧版合并成 1 张大卡片导致误报 0/0）
     if (saved && saved.schemaVer === SCHEMA_VER && !state.scanning) {
       state.tickets = saved.tickets || [];
       state.availDates = saved.availDates || [];
-      state.targetDate = saved.targetDate || '';
-      state.sheetName = saved.sheetName || '';
-      state.sourceName = saved.sourceName || '';
-      state.parseMode = saved.parseMode || '';
+      state.startDate = saved.startDate || (state.availDates[0] || '');
+      state.endDate = saved.endDate || state.startDate;
+      state.sourceLabel = saved.sourceLabel || '';
       state.auditFilter = saved.auditFilter || 'unmatched';
       state.scanLog = saved.scanLog || '';
     }
     state._hydrated = true;
   }
 
-  function findCol(headers, candidates) {
-    for (const c of candidates) {
-      const idx = headers.findIndex(h => h === c);
-      if (idx !== -1) return idx;
-    }
-    for (const c of candidates) {
-      const idx = headers.findIndex(h => h.includes(c));
-      if (idx !== -1) return idx;
-    }
-    return -1;
+  /** 直接从同源 HJF 出库核算的 IndexedDB / localStorage 读取「2. 历史出库底表（总账可编辑）」 */
+  async function readHjfMasterRecordsFromBrowser() {
+    // 1. 优先读取 IndexedDB HJF_Ledger_DB_v292 -> kv -> hjf_master_records_v292
+    try {
+      const db = await new Promise((resolve, reject) => {
+        const req = indexedDB.open(HJF_IDB_NAME, 1);
+        req.onupgradeneeded = () => {
+          if (!req.result.objectStoreNames.contains('kv')) req.result.createObjectStore('kv');
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      const rec = await new Promise((resolve, reject) => {
+        const tx = db.transaction('kv', 'readonly');
+        const req = tx.objectStore('kv').get(HJF_MASTER_KEY);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+      if (Array.isArray(rec) && rec.length > 0) return rec;
+    } catch {}
+
+    // 2. 兜底读取 localStorage
+    try {
+      const raw = localStorage.getItem(HJF_MASTER_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {}
+    return [];
   }
 
-  /** 智能载入当天出库清单：自动兼容 ERP《材料出库单列表》(按单据号拆票) 与 HJF 14列总账(按空行拆票) */
-  async function loadTicketsFile(file) {
-    const parsed = await U.readSpreadsheet(file);
-    let bestSn = parsed.sheetNames[0];
-    let bestCount = -1;
-    for (const sn of parsed.sheetNames) {
-      const rows = parsed.sheets[sn] || [];
-      const nonEmpty = rows.filter(r => r.some(v => U.cleanStr(v) !== '')).length;
-      if (nonEmpty > bestCount) {
-        bestCount = nonEmpty;
-        bestSn = sn;
+  /** 将 HJF 历史底表记录数组转为按【日期+车间+领料人+仓库+自取/特殊】分组的独立单据（保留已核对状态） */
+  function buildTicketsFromHjfRecords(records, sourceLabel) {
+    // 记录旧的人工/自动核销状态（避免同步底表时冲掉已核对进度）
+    const prevCheckedByKey = new Map();
+    state.tickets.forEach(t => {
+      if (t.key && t.checked) {
+        prevCheckedByKey.set(t.key, { checked: t.checked, matchType: t.matchType, matchedPage: t.matchedPage, matchedDoc: t.matchedDoc });
       }
-    }
-    const aoa = parsed.sheets[bestSn] || [];
-    if (aoa.length < 2) throw new Error('表格无有效数据行');
+    });
 
-    // 1. 检测是否为 ERP 材料出库单列表 / 16列台账（含「单据号」列）
-    let erpHdrIdx = -1;
-    for (let i = 0; i < Math.min(10, aoa.length); i++) {
-      const line = aoa[i].map(v => U.cleanStr(v)).join(' ');
-      if ((line.includes('单据号') || line.includes('出库单号')) && (line.includes('物料编码') || line.includes('存货编码') || line.includes('物料名称'))) {
-        erpHdrIdx = i;
-        break;
+    const groups = new Map();
+    const dateSet = new Set();
+
+    for (const r of records) {
+      if (!r || r._isBlank) continue;
+      const name = U.cleanStr(r.name);
+      if (!name) continue;
+      if (GAS_KEYWORDS.some(g => name.includes(g))) continue; // 铁律：剔除含丁烷气罐在内的全部气体
+
+      const dateStr = U.formatDate(r.date || '');
+      if (dateStr) dateSet.add(dateStr);
+      const dept = U.cleanStr(r.dept) || '未知车间';
+      const rec = U.cleanStr(r.person);
+      const wh = U.cleanStr(r.warehouse).replace(/（.*）$/, '');
+      const pickup = U.cleanStr(r.pickup);
+      const special = U.cleanStr(r.special);
+      const tag = (special || pickup) ? `${wh}（${special || pickup}）` : wh;
+      const code = U.formatCode(r.code || '');
+      const qty = U.cleanStr(r.qty);
+      const unit = U.cleanStr(r.unit);
+
+      const gKey = `${dateStr}||${dept}||${rec}||${wh}||${pickup}||${special}`;
+      if (!groups.has(gKey)) {
+        const prev = prevCheckedByKey.get(gKey);
+        groups.set(gKey, {
+          id: groups.size + 1,
+          key: gKey,
+          date: dateStr,
+          dept,
+          rec,
+          wh,
+          tag,
+          items: [],
+          checked: prev ? prev.checked : false,
+          matchType: prev ? prev.matchType : '',
+          matchedPage: prev ? prev.matchedPage : 0,
+          matchedDoc: prev ? prev.matchedDoc : ''
+        });
       }
+      groups.get(gKey).items.push({ code, name, qty, unit });
     }
 
     const tickets = [];
-    const dateSet = new Set();
-
-    if (erpHdrIdx >= 0) {
-      // 模式 A：ERP 材料出库单列表 / 16 列台账 -> 按单据号分组拆票，绝不合并成一张！
-      const h = aoa[erpHdrIdx].map(v => U.cleanStr(v));
-      const iDoc = findCol(h, ['单据号', '出库单号']);
-      const iDate = findCol(h, ['出库日期', '单据日期', '日期']);
-      const iWh = findCol(h, ['仓库', '仓库名称']);
-      const iDept = findCol(h, ['领料部门', '部门', '车间']);
-      const iCode = findCol(h, ['物料编码', '存货编码', '物资编码']);
-      const iName = findCol(h, ['物料名称', '存货名称', '物资名称']);
-      const iUnit = findCol(h, ['单位', '主单位']);
-      const iQty = findCol(h, ['实发数量', '出库数量', '数量']);
-      const iRem = findCol(h, ['备注']);
-      const iLrem = findCol(h, ['行备注']);
-
-      const docGroups = new Map();
-      let dataRows = aoa.slice(erpHdrIdx + 1);
-      while (dataRows.length > 0) {
-        const last = dataRows[dataRows.length - 1];
-        const c0 = U.cleanStr(last[0]);
-        if (c0 === '合计' || c0 === '总计' || last.every(v => !U.cleanStr(v))) dataRows.pop();
-        else break;
-      }
-
-      for (const r of dataRows) {
-        const docNo = iDoc >= 0 ? U.cleanStr(r[iDoc]).toUpperCase() : '';
-        const name = iName >= 0 ? U.cleanStr(r[iName]) : '';
-        if (!docNo || !name) continue;
-        if (GAS_KEYWORDS.some(g => name.includes(g))) continue; // 铁律：剔除全部气体含丁烷气罐
-
-        const dateStr = iDate >= 0 ? U.formatDate(r[iDate]) : '';
-        if (dateStr) dateSet.add(dateStr);
-        const dept = iDept >= 0 ? U.cleanStr(r[iDept]) : '未知车间';
-        const wh = iWh >= 0 ? U.cleanStr(r[iWh]) : '';
-        const rem = iRem >= 0 ? U.cleanStr(r[iRem]) : '';
-        const lrem = iLrem >= 0 ? U.cleanStr(r[iLrem]) : '';
-        const code = iCode >= 0 ? U.formatCode(r[iCode]) : '';
-        const qty = iQty >= 0 ? U.fmtNum(r[iQty]) : '';
-        const unit = iUnit >= 0 ? U.cleanStr(r[iUnit]) : '';
-
-        if (!docGroups.has(docNo)) {
-          const isSelf = `${rem} ${lrem}`.includes('自取');
-          docGroups.set(docNo, {
-            id: docGroups.size + 1,
-            docNo,
-            shortDoc: docNo.length > 8 ? `…${docNo.slice(-6)}` : docNo,
-            date: dateStr,
-            dept: dept || '未知车间',
-            rec: rem,
-            wh,
-            tag: isSelf ? `${wh}（自取）` : wh,
-            items: [],
-            checked: false,
-            matchType: '',
-            matchedPage: 0
-          });
-        }
-        docGroups.get(docNo).items.push({ code, name, qty, unit });
-      }
-      docGroups.forEach(t => { if (t.items.length > 0) tickets.push(t); });
-      state.parseMode = 'erp_doc';
-    } else {
-      // 模式 B：HJF 14 列 / 历史出库总账 -> 按空行切分独立单据
-      const firstCleaned = (aoa[0] || []).map(v => U.cleanStr(v));
-      const hasHeader = /^(日期|车间|部门|领料部门)$/.test(firstCleaned[0] || '') ||
-        (firstCleaned.includes('车间') && firstCleaned.includes('仓库'));
-
-      let hasDateCol = firstCleaned[0] === '日期' || firstCleaned[0].includes('日期');
-      if (!hasDateCol) {
-        for (let i = hasHeader ? 1 : 0; i < Math.min(10, aoa.length); i++) {
-          const c0 = U.cleanStr((aoa[i] || [])[0]);
-          if (c0) {
-            if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}/.test(c0)) hasDateCol = true;
-            break;
-          }
-        }
-      }
-      const off = hasDateCol ? 1 : 0;
-
-      const rawBlocks = [];
-      let cur = [];
-      aoa.forEach((row, idx) => {
-        const cleaned = row.map(v => U.cleanStr(v));
-        if (idx === 0 && hasHeader) return;
-        if (cleaned.every(v => v === '')) {
-          if (cur.length) { rawBlocks.push(cur); cur = []; }
-        } else {
-          cur.push(cleaned);
-        }
-      });
-      if (cur.length) rawBlocks.push(cur);
-
-      rawBlocks.forEach((rows, bIdx) => {
-        const dateStr = hasDateCol ? U.formatDate(rows[0][0]) : '';
-        if (dateStr) dateSet.add(dateStr);
-        const dept = rows[0][off + 0] || '未知车间';
-        const rec = rows[0][off + 1] || '';
-        const wh = (rows[0][off + 2] || '').replace(/（.*）$/, '');
-        const sp = rows[0][off + 13] || '';
-        const zq = rows[0][off + 12] || '';
-        const tag = (sp || zq) ? `${wh}（${sp || zq}）` : wh;
-
-        const items = [];
-        for (const r of rows) {
-          const code = U.formatCode(r[off + 3] || '');
-          const name = r[off + 4] || '';
-          const qty = r[off + 5] || '';
-          const unit = r[off + 6] || '';
-          if (!name) continue;
-          if (GAS_KEYWORDS.some(g => name.includes(g))) continue;
-          items.push({ code, name, qty, unit });
-        }
-        if (items.length > 0) {
-          tickets.push({
-            id: bIdx + 1,
-            docNo: '',
-            shortDoc: `#${bIdx + 1}`,
-            date: dateStr,
-            dept,
-            rec,
-            wh,
-            tag,
-            items,
-            checked: false,
-            matchType: '',
-            matchedPage: 0
-          });
-        }
-      });
-      state.parseMode = 'blank_block';
-    }
+    groups.forEach(t => { if (t.items.length > 0) tickets.push(t); });
+    const availDates = Array.from(dateSet).sort().reverse();
 
     state.tickets = tickets;
-    state.availDates = Array.from(dateSet).sort().reverse();
-    state.targetDate = '';
-    state.sheetName = bestSn;
-    state.sourceName = file.name;
-    state.auditFilter = 'unmatched';
-
-    // 若已载入 PDF 页，立刻重新自动核对一次
-    if (state.pdfPages.length > 0) runAutoMatchAgainstPages();
-    persistState();
-    const modeTxt = state.parseMode === 'erp_doc' ? '按单据号拆票' : '按空行拆票';
-    U.toast(`从 [${bestSn}] ${modeTxt}：共 ${tickets.length} 张非气体独立单据（已剔除全部气体）`, 'success');
+    state.availDates = availDates;
+    // 若当前日期未设或不在新日期列表内，默认自动锁定 HJF 最新业务日期（单日）
+    if (!state.startDate || !availDates.includes(state.startDate)) {
+      state.startDate = availDates[0] || '';
+      state.endDate = availDates[0] || '';
+    }
+    if (!state.endDate || !availDates.includes(state.endDate)) {
+      state.endDate = state.startDate;
+    }
+    state.sourceLabel = sourceLabel;
   }
 
-  /** 将已扫描的 PDF 页面提取结果（单据号 + 物料编码）与右侧出库单据自动比对核销 */
-  function runAutoMatchAgainstPages() {
-    if (!state.tickets.length || !state.pdfPages.length) return 0;
+  /** 自动同步 HJF 出库核算 -> 历史出库底表（总账可编辑） */
+  async function syncFromHjfLedger(silent = false) {
+    const records = await readHjfMasterRecordsFromBrowser();
+    if (!records.length) {
+      if (!silent) U.toast('当前浏览器【HJF 出库核算 -> 历史出库底表】暂无记录，请先核算或手动导入 HJF 物资出库总账 (.xlsx)', 'warn');
+      return false;
+    }
+    state.manualFileLoaded = false;
+    buildTicketsFromHjfRecords(records, `直连 HJF 历史底表总账（${records.length} 条记录）`);
+    if (state.pdfPages.length > 0) runAutoMatchScoped();
+    persistState();
+    if (!silent) {
+      U.toast(`已同步 HJF 历史底表：共 ${state.tickets.length} 张非气体单据（覆盖 ${state.availDates.length} 个日期）`, 'success');
+    }
+    return true;
+  }
 
-    // 重置页面反查索引
-    state.pdfPages.forEach(p => { p.matchedTicketIds = []; });
+  /** 手动导入《HJF物资出库总账.xlsx》或 14 列 HJF 出库单（备用，严格按 HJF 格式拆票） */
+  async function loadHjfExcelFile(file) {
+    const parsed = await U.readSpreadsheet(file);
+    const ledgerSn = parsed.sheetNames.find(n => n.includes('历史出库底表')) || parsed.sheetNames[0];
+    const aoa = parsed.sheets[ledgerSn] || [];
+    if (aoa.length < 2) throw new Error('HJF 出库总账无有效数据');
 
-    // 建立 单据号 -> 页码 索引，及 编码 -> 页码集合 索引
-    const docToPage = new Map();
-    state.pdfPages.forEach((p, idx) => {
-      (p.docs || []).forEach(d => {
-        if (!docToPage.has(d)) docToPage.set(d, idx + 1);
-      });
+    const firstCleaned = (aoa[0] || []).map(v => U.cleanStr(v));
+    const hasHeader = /^(业务日期|日期|车间|部门)$/.test(firstCleaned[0] || '') ||
+      (firstCleaned.includes('车间') && firstCleaned.includes('仓库'));
+    let hasDateCol = firstCleaned[0].includes('日期');
+    if (!hasDateCol) {
+      for (let i = hasHeader ? 1 : 0; i < Math.min(10, aoa.length); i++) {
+        const c0 = U.cleanStr((aoa[i] || [])[0]);
+        if (c0) { if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}/.test(c0)) hasDateCol = true; break; }
+      }
+    }
+    const off = hasDateCol ? 1 : 0;
+
+    // 按空行切块构建独立 HJF 单据
+    const rawBlocks = [];
+    let cur = [];
+    aoa.forEach((row, idx) => {
+      const cleaned = row.map(v => U.cleanStr(v));
+      if (idx === 0 && hasHeader) return;
+      if (cleaned.every(v => v === '')) {
+        if (cur.length) { rawBlocks.push(cur); cur = []; }
+      } else {
+        cur.push(cleaned);
+      }
+    });
+    if (cur.length) rawBlocks.push(cur);
+
+    const tickets = [];
+    const dateSet = new Set();
+    rawBlocks.forEach((rows, bIdx) => {
+      const dateStr = hasDateCol ? U.formatDate(rows[0][0]) : '';
+      if (dateStr) dateSet.add(dateStr);
+      const dept = rows[0][off + 0] || '未知车间';
+      const rec = rows[0][off + 1] || '';
+      const wh = (rows[0][off + 2] || '').replace(/（.*）$/, '');
+      const sp = rows[0][off + 13] || '';
+      const zq = rows[0][off + 12] || '';
+      const tag = (sp || zq) ? `${wh}（${sp || zq}）` : wh;
+
+      const items = [];
+      for (const r of rows) {
+        const code = U.formatCode(r[off + 3] || '');
+        const name = r[off + 4] || '';
+        const qty = r[off + 5] || '';
+        const unit = r[off + 6] || '';
+        if (!name) continue;
+        if (GAS_KEYWORDS.some(g => name.includes(g))) continue;
+        items.push({ code, name, qty, unit });
+      }
+      if (items.length > 0) {
+        tickets.push({
+          id: bIdx + 1,
+          key: `file_${bIdx + 1}_${dateStr}_${dept}_${wh}`,
+          date: dateStr,
+          dept,
+          rec,
+          wh,
+          tag,
+          items,
+          checked: false,
+          matchType: '',
+          matchedPage: 0,
+          matchedDoc: ''
+        });
+      }
     });
 
+    const availDates = Array.from(dateSet).sort().reverse();
+    state.tickets = tickets;
+    state.availDates = availDates;
+    state.startDate = availDates[0] || '';
+    state.endDate = availDates[0] || '';
+    state.sourceLabel = `导入文件：${file.name} [${ledgerSn}]`;
+    state.manualFileLoaded = true;
+    state.auditFilter = 'unmatched';
+    if (state.pdfPages.length > 0) runAutoMatchScoped();
+    persistState();
+    U.toast(`已载入 HJF 出库表：共 ${tickets.length} 张非气体单据（默认锁定最新日期 ${state.startDate || '全部'}）`, 'success');
+  }
+
+  /** 获取当前日期区间内需要核对的 HJF 单据（例如 27 号，或 27~28 号） */
+  function getScopedTickets() {
+    let s = state.startDate;
+    let e = state.endDate;
+    if (!s && !e) return state.tickets;
+    if (s && !e) e = s;
+    if (!s && e) s = e;
+    if (s > e) [s, e] = [e, s];
+    return state.tickets.filter(t => !t.date || (t.date >= s && t.date <= e));
+  }
+
+  /** 严格只对「当前日期区间内」的 HJF 单据执行自动核对（按物料编码集合 + 日期匹配 PDF 页） */
+  function runAutoMatchScoped() {
+    const scoped = getScopedTickets();
+    if (!scoped.length || !state.pdfPages.length) return 0;
+
+    state.pdfPages.forEach(p => { p.matchedTicketIds = []; });
+    let sDate = state.startDate;
+    let eDate = state.endDate || sDate;
+    if (sDate && eDate && sDate > eDate) [sDate, eDate] = [eDate, sDate];
+
     let newlyAuto = 0;
-    state.tickets.forEach(t => {
-      // 保留人工已核销的记录；对未人工核销的尝试自动匹配
+    scoped.forEach(t => {
       if (t.matchType === 'manual') return;
 
-      let matchedPage = 0;
-      // 优先 1：单据号精确匹配（ERP 出库单 100% 精准）
-      if (t.docNo && docToPage.has(t.docNo)) {
-        matchedPage = docToPage.get(t.docNo);
-      } else {
-        // 优先 2：按单据内 10/11 位物料编码集合比对各 PDF 页（兼容无单据号清单或单据号 OCR 模糊页）
-        const tCodes = Array.from(new Set(t.items.map(it => it.code).filter(c => /^0[356789]\d{8,9}$/.test(c))));
-        if (tCodes.length > 0) {
-          let bestPage = 0;
-          let bestHits = 0;
-          state.pdfPages.forEach((p, idx) => {
-            if (!p.codes || !p.codes.length) return;
-            const pSet = new Set(p.codes);
-            let hits = 0;
-            tCodes.forEach(c => { if (pSet.has(c)) hits++; });
-            const need = tCodes.length === 1 ? 1 : Math.ceil(tCodes.length * 0.5);
-            if (hits >= need && hits > bestHits) {
-              bestHits = hits;
-              bestPage = idx + 1;
-            }
-          });
-          if (bestPage > 0) matchedPage = bestPage;
-        }
-      }
+      const tCodes = Array.from(new Set(
+        t.items.map(it => U.formatCode(it.code)).filter(c => /^0[356789]\d{8,9}$/.test(c))
+      ));
+      if (!tCodes.length) return;
 
-      if (matchedPage > 0) {
+      let bestPage = 0;
+      let bestScore = 0;
+      let bestDoc = '';
+
+      state.pdfPages.forEach((p, idx) => {
+        // 若 PDF 页面识别出了明确日期，且该 HJF 单据也有明确日期，优先要求同日或落于选定区间内
+        if (t.date && p.dates && p.dates.length > 0) {
+          const sameDay = p.dates.includes(t.date);
+          const inRange = sDate && eDate && p.dates.some(d => d >= sDate && d <= eDate);
+          if (!sameDay && !inRange) return;
+        }
+        if (!p.codes || !p.codes.length) return;
+        const pSet = new Set(p.codes);
+        let hits = 0;
+        tCodes.forEach(c => { if (pSet.has(c)) hits++; });
+        const need = tCodes.length === 1 ? 1 : Math.ceil(tCodes.length * 0.5);
+        if (hits >= need) {
+          const sameDayBonus = (t.date && p.dates && p.dates.includes(t.date)) ? 10 : 0;
+          const score = hits * 2 + sameDayBonus;
+          if (score > bestScore) {
+            bestScore = score;
+            bestPage = idx + 1;
+            bestDoc = (p.docs && p.docs[0]) || '';
+          }
+        }
+      });
+
+      if (bestPage > 0) {
         if (!t.checked) newlyAuto++;
         t.checked = true;
         t.matchType = 'auto';
-        t.matchedPage = matchedPage;
-        const pageObj = state.pdfPages[matchedPage - 1];
+        t.matchedPage = bestPage;
+        t.matchedDoc = bestDoc;
+        const pageObj = state.pdfPages[bestPage - 1];
         if (pageObj && !pageObj.matchedTicketIds.includes(t.id)) {
           pageObj.matchedTicketIds.push(t.id);
         }
@@ -355,18 +449,18 @@
     const pool = [];
     for (let i = 0; i < 2; i++) {
       const w = await Tesseract.createWorker('eng');
-      await w.setParameters({ tessedit_char_whitelist: 'CCHFKGOQIL0123456789' });
+      await w.setParameters({ tessedit_char_whitelist: 'CCHFKGOQIL0123456789-./' });
       pool.push(w);
     }
     ocrWorkers = pool;
     return pool;
   }
 
-  /** 后台导入并自动核对出库扫描 PDF（纯 PDF，支持切标签不中断） */
+  /** 后台自动核对出库扫描 PDF：自动识别文件名/页内日期范围 -> 只核对对应日期的 HJF 出库单 */
   function startBackgroundPdfAudit(files) {
     const pdfs = Array.from(files || []).filter(f => /\.pdf$/i.test(f.name));
     if (!pdfs.length) {
-      U.toast('本模块已统一为纯 PDF 核对，请拖入出库扫描件 (.pdf)', 'warn');
+      U.toast('本模块为纯 PDF 核对，请拖入出库扫描 PDF (.pdf)', 'warn');
       return;
     }
     if (state.scanning) {
@@ -377,10 +471,9 @@
     state.scanning = true;
     state.pdfPages = [];
     state.activePageIdx = 0;
-    state.scanLog = `⏳ 后台已启动：正在解析 ${pdfs.length} 份出库 PDF 并自动核对（可自由切去其他标签页）...`;
-    setGlobalBgPill('⏳ 出库PDF后台核对中...', true, false);
+    state.scanLog = `⏳ 后台已启动：正在同步 HJF 底表并解析 ${pdfs.length} 份 PDF（可切去其他板块）...`;
+    setGlobalBgPill('⏳ HJF出库PDF后台核对中...', true, false);
     refreshIfVisible();
-    U.toast('出库 PDF 已转入后台自动核对，完成后你只需人工复核未检索到的单据！', 'info');
 
     (async () => {
       let totalPages = 0;
@@ -388,17 +481,34 @@
       let ocrPages = 0;
 
       const updateStatus = (msg) => {
-        const autoCnt = state.tickets.filter(t => t.matchType === 'auto').length;
-        const foundDocs = new Set(state.pdfPages.flatMap(p => p.docs || [])).size;
-        state.scanLog = state.tickets.length
-          ? `⏳ ${msg} ｜ 已检出 ${foundDocs} 个单号 · 平台自动核销 ${autoCnt}/${state.tickets.length} 张`
-          : `⏳ ${msg} ｜ 已检出 ${foundDocs} 个单号（请顺手导入「1. 出库清单」即可自动匹配）`;
-        setGlobalBgPill(`⏳ 出库PDF ${donePages}/${totalPages || '?'}页 · 检出${foundDocs}单`, true, false);
+        const scoped = getScopedTickets();
+        const autoCnt = scoped.filter(t => t.matchType === 'auto').length;
+        const foundCodes = new Set(state.pdfPages.flatMap(p => p.codes || [])).size;
+        state.scanLog = scoped.length
+          ? `⏳ ${msg} ｜ 检出 ${foundCodes} 个物料编码 · 当前日期区间(${state.startDate}~${state.endDate})已自动核销 ${autoCnt}/${scoped.length} 张`
+          : `⏳ ${msg} ｜ 检出 ${foundCodes} 个编码（当前日期区间无 HJF 记录，请调整日期或点同步 HJF 底表）`;
+        setGlobalBgPill(`⏳ HJF出库PDF ${donePages}/${totalPages || '?'}页 · 已核${autoCnt}/${scoped.length}`, true, false);
         const stEl = activeRoot && activeRoot.isConnected ? activeRoot.querySelector('#p-scan-log') : null;
         if (stEl) stEl.textContent = state.scanLog;
       };
 
       try {
+        // 开始前先静默同步一次最新的 HJF 历史底表（保证刚在 HJF 板块算完的新单立即可用，且不覆盖用户刚手动导入的 Excel）
+        if (!state.manualFileLoaded) await syncFromHjfLedger(true);
+
+        // 按 PDF 文件名自动锁定对应的 HJF 日期区间（如 11.27.pdf / 27号.pdf -> 只看 27 号；27-28日.pdf -> 只看 27~28 号）
+        const fnRange = detectDateRangeFromFileNames(pdfs.map(f => f.name), state.availDates);
+        if (fnRange) {
+          state.startDate = fnRange.start;
+          state.endDate = fnRange.end;
+          U.toast(`已按 PDF 文件名自动锁定 HJF 核对日期：${fnRange.start}${fnRange.end !== fnRange.start ? ' ~ ' + fnRange.end : ''}`, 'info');
+        }
+        // 重置当前区间内旧的自动核销标记（保留人工确认及其他日期的历史记录）
+        getScopedTickets().forEach(t => {
+          if (t.matchType === 'auto') { t.checked = false; t.matchType = ''; t.matchedPage = 0; t.matchedDoc = ''; }
+        });
+        refreshIfVisible();
+
         const loaded = [];
         for (const f of pdfs) {
           const buf = await f.arrayBuffer();
@@ -414,7 +524,6 @@
           for (let p = 1; p <= item.pdf.numPages; p++) {
             globalPageSeq++;
             const page = await item.pdf.getPage(p);
-            // 渲染清晰度 1.8x（保证单据号小字清晰可 OCR）
             const vp = page.getViewport({ scale: 1.8 });
             const canvas = document.createElement('canvas');
             canvas.width = vp.width;
@@ -426,6 +535,7 @@
             const textStr = textContent.items.map(it => it.str).join(' ');
             const docs = extractDocsFromText(textStr);
             const codes = Array.from(new Set(textStr.match(CODE_REGEX) || []));
+            const dates = extractDatesFromPage(textStr, docs);
 
             const pageEntry = {
               pageNum: globalPageSeq,
@@ -433,13 +543,14 @@
               url: dataUrl,
               docs,
               codes,
+              dates,
               matchedTicketIds: []
             };
             state.pdfPages.push(pageEntry);
 
-            if (docs.length > 0 || codes.length > 0) {
+            if (codes.length > 0 || docs.length > 0) {
               donePages++;
-              runAutoMatchAgainstPages();
+              runAutoMatchScoped();
               updateStatus(`高速解析第 ${donePages}/${totalPages} 页`);
             } else {
               ocrQueue.push({ pageEntry, canvas });
@@ -449,9 +560,8 @@
 
         refreshIfVisible();
 
-        // 对纯图片扫描页启用双核复用 OCR（优先高清晰裁剪单据头区抓单号，再扫全页抓物料编码）
         if (ocrQueue.length > 0 && window.Tesseract) {
-          updateStatus(`开始双核 OCR 自动核对 ${ocrQueue.length} 页扫描单据...`);
+          updateStatus(`启动双核 OCR 识别 ${ocrQueue.length} 页出库单（抓物料编码与日期）...`);
           const pool = await getOcrWorkerPool();
           let qIdx = 0;
 
@@ -461,31 +571,29 @@
               ocrPages++;
               const src = job.canvas;
 
-              // 1) 重点放大裁剪上半部表头区（单据号 OrderNum 所在区），大幅提高 CCHF 单号识别率
+              // 1) 上半部表头区（抓单据号/日期）
               const topCanvas = document.createElement('canvas');
               topCanvas.width = src.width;
               topCanvas.height = Math.max(100, Math.round(src.height * 0.42));
               topCanvas.getContext('2d').drawImage(src, 0, 0, topCanvas.width, topCanvas.height, 0, 0, topCanvas.width, topCanvas.height);
 
-              const rTop = worker
-                ? await worker.recognize(topCanvas)
-                : await Tesseract.recognize(topCanvas, 'eng');
-              let docs = extractDocsFromText(rTop.data.text || '');
+              const rTop = worker ? await worker.recognize(topCanvas) : await Tesseract.recognize(topCanvas, 'eng');
+              const topTxt = rTop.data.text || '';
 
-              // 2) 全页识别（提取全部 10/11 位物料编码 + 兜底补抓单号）
-              const rFull = worker
-                ? await worker.recognize(src)
-                : await Tesseract.recognize(src, 'eng');
+              // 2) 全页识别（抓全部 10/11 位物料编码）
+              const rFull = worker ? await worker.recognize(src) : await Tesseract.recognize(src, 'eng');
               const fullTxt = rFull.data.text || '';
-              const moreDocs = extractDocsFromText(fullTxt);
-              docs = Array.from(new Set([...docs, ...moreDocs]));
+
+              const docs = Array.from(new Set([...extractDocsFromText(topTxt), ...extractDocsFromText(fullTxt)]));
               const codes = Array.from(new Set(fullTxt.match(CODE_REGEX) || []));
+              const dates = extractDatesFromPage(`${topTxt} ${fullTxt}`, docs);
 
               job.pageEntry.docs = docs;
               job.pageEntry.codes = codes;
+              job.pageEntry.dates = dates;
               donePages++;
 
-              const added = runAutoMatchAgainstPages();
+              const added = runAutoMatchScoped();
               if (added > 0) {
                 persistState();
                 refreshIfVisible();
@@ -498,22 +606,36 @@
           else await runWorker(null);
         }
 
-        runAutoMatchAgainstPages();
-        const foundDocs = new Set(state.pdfPages.flatMap(p => p.docs || [])).size;
-        const foundCodes = new Set(state.pdfPages.flatMap(p => p.codes || [])).size;
-        const autoCnt = state.tickets.filter(t => t.matchType === 'auto').length;
-        const remainCnt = state.tickets.filter(t => !t.checked).length;
+        // 若文件名没写日期，尝试根据 PDF 页内识别出的实际日期自动对齐日期范围
+        if (!fnRange && state.availDates.length) {
+          const detectedInAvail = Array.from(new Set(
+            state.pdfPages.flatMap(p => p.dates || []).filter(d => state.availDates.includes(d))
+          )).sort();
+          if (detectedInAvail.length > 0) {
+            state.startDate = detectedInAvail[0];
+            state.endDate = detectedInAvail[detectedInAvail.length - 1];
+          }
+        }
 
-        if (!state.tickets.length) {
-          state.scanLog = `⚠️ 已扫完 ${totalPages} 页 PDF（检出 ${foundDocs} 个单号 / ${foundCodes} 个物料编码），但你尚未导入「1. 出库清单」，请拖入 Excel 即可瞬间完成自动核对！`;
-          setGlobalBgPill(`⚠️ PDF已扫完(${foundDocs}单) · 请导入清单`, true, true);
-          U.toast(`PDF 已扫完（检出 ${foundDocs} 个单号），请再导入「1. 出库清单」自动比对！`, 'warn');
+        runAutoMatchScoped();
+        const scoped = getScopedTickets();
+        const foundCodes = new Set(state.pdfPages.flatMap(p => p.codes || [])).size;
+        const autoCnt = scoped.filter(t => t.matchType === 'auto').length;
+        const remainCnt = scoped.filter(t => !t.checked).length;
+
+        const rangeTxt = state.startDate === state.endDate
+          ? (state.startDate || '全部')
+          : `${state.startDate} ~ ${state.endDate}`;
+
+        if (!scoped.length) {
+          state.scanLog = `⚠️ 已扫完 ${totalPages} 页 PDF（检出 ${foundCodes} 个物料编码），但当前选定日期 [${rangeTxt}] 在 HJF 历史底表中无单据，请切换上方日期区间或先同步 HJF 历史底表！`;
+          setGlobalBgPill(`⚠️ 日期[${rangeTxt}]无HJF单据`, true, true);
         } else {
-          state.scanLog = `✅ 平台自动核对完成：共 ${totalPages} 页 PDF（检出 ${foundDocs} 个单号 / ${foundCodes} 个编码）｜ 平台已核销 ${autoCnt}/${state.tickets.length} 张，剩余 ${remainCnt} 张待你人工核对！`;
+          state.scanLog = `✅ 核对完成 [${rangeTxt}]：共 ${totalPages} 页 PDF（检出 ${foundCodes} 个编码）｜ 平台已核销 ${autoCnt}/${scoped.length} 张 HJF 单据，仅剩 ${remainCnt} 张待你人工核对！`;
           persistState();
-          setGlobalBgPill(`✅ 出库PDF核完 · 已核${autoCnt}/剩${remainCnt}`, true, true);
+          setGlobalBgPill(`✅ HJF核完[${rangeTxt}] · 剩${remainCnt}单`, true, true);
           setTimeout(() => { if (!state.scanning) setGlobalBgPill('', false); }, 12000);
-          U.toast(`平台已自动核销 ${autoCnt} 张，剩余 ${remainCnt} 张未检索到需人工复核！`, 'success');
+          U.toast(`HJF [${rangeTxt}] 自动核销 ${autoCnt} 张，仅剩 ${remainCnt} 张未检索到需人工复核！`, 'success');
         }
       } catch (err) {
         state.scanLog = `❌ 出库 PDF 核对异常：${err.message}`;
@@ -527,9 +649,7 @@
   }
 
   function renderModule(root) {
-    const scopedTickets = state.targetDate
-      ? state.tickets.filter(t => t.date === state.targetDate)
-      : state.tickets;
+    const scopedTickets = getScopedTickets();
     const total = scopedTickets.length;
     const autoDone = scopedTickets.filter(t => t.checked && t.matchType === 'auto').length;
     const manualDone = scopedTickets.filter(t => t.checked && t.matchType === 'manual').length;
@@ -537,40 +657,52 @@
 
     let listToShow = scopedTickets;
     if (state.auditFilter === 'unmatched') listToShow = missing;
-    else if (state.auditFilter === 'auto') listToShow = scopedTickets.filter(t => t.checked);
+    else if (state.auditFilter === 'done') listToShow = scopedTickets.filter(t => t.checked);
 
-    // 左侧 PDF 展示列表（支持只看未匹配到单据的孤立 PDF 页，方便人工排查）
     const visiblePages = state.onlyUnmatchedPages
       ? state.pdfPages.filter(p => !p.matchedTicketIds || p.matchedTicketIds.length === 0)
       : state.pdfPages;
     if (state.activePageIdx >= visiblePages.length) state.activePageIdx = Math.max(0, visiblePages.length - 1);
     const curPage = visiblePages[state.activePageIdx];
 
+    const rangeLabel = state.startDate && state.endDate
+      ? (state.startDate === state.endDate ? state.startDate : `${state.startDate} ~ ${state.endDate}`)
+      : '全部日期';
+
     root.innerHTML = `
       <div class="panel">
         <div class="panel-title">
-          <span>📑 出库扫描 PDF 自动核对（平台自动检索核销 · 人工仅复核未检索单据 · 自动剔除气体）</span>
-          <span class="pill ${missing.length ? 'pill-red' : 'pill-green'}">待人工核对：${missing.length} / ${total}${state.sheetName ? ` · ${state.sheetName}` : ''}</span>
+          <span>📑 HJF 出库扫描 PDF 自动核对（直连 HJF 历史出库底表 · 按日期区间精准核对 · 自动剔除气体）</span>
+          <span class="pill ${missing.length ? 'pill-red' : 'pill-green'}">日期：${U.escHtml(rangeLabel)} ｜ 待人工核对：${missing.length} / ${total}</span>
         </div>
         <div class="kpi-grid">
-          <div class="kpi-card blue"><div class="kpi-label">清单有效独立单据数</div><div class="kpi-val">${total}</div></div>
-          <div class="kpi-card green"><div class="kpi-label">🤖 平台自动检索已核</div><div class="kpi-val">${autoDone}</div></div>
+          <div class="kpi-card blue"><div class="kpi-label">区间内 HJF 独立单据数</div><div class="kpi-val">${total}</div></div>
+          <div class="kpi-card green"><div class="kpi-label">🤖 平台自动核销</div><div class="kpi-val">${autoDone}</div></div>
           <div class="kpi-card"><div class="kpi-label">👤 人工确认已核</div><div class="kpi-val">${manualDone}</div></div>
           <div class="kpi-card ${missing.length ? 'red' : 'green'}"><div class="kpi-label">🔴 未检索到（待人工核对）</div><div class="kpi-val">${missing.length}</div></div>
         </div>
         <div class="toolbar">
-          <button class="btn btn-primary" id="p-up-csv">📂 1. 导入出库清单 (ERP列表 / HJF总账)</button>
+          <button class="btn btn-primary" id="p-sync-hjf">🔄 1. 同步 HJF 历史出库底表</button>
+          <button class="btn" id="p-up-csv" title="若在另一台电脑，也可手动导入 HJF物资出库总账.xlsx">📂 或手动导入 HJF 总账 (.xlsx)</button>
           <input type="file" id="p-in-csv" accept=".csv,.xlsx,.xls" class="hidden-input" />
-          <button class="btn btn-warning" id="p-up-pdf">📄 2. 导入出库扫描 PDF（平台自动核对）</button>
+          <button class="btn btn-warning" id="p-up-pdf">📄 2. 拖入/导入对应日期出库 PDF</button>
           <input type="file" id="p-in-pdf" accept=".pdf" multiple class="hidden-input" />
-          ${state.availDates.length > 0 ? `
-            <select id="p-date-sel" title="按表格内自然日筛选">
-              <option value="">全部日期 (${state.tickets.length} 单)</option>
-              ${state.availDates.map(d => `<option value="${d}" ${d === state.targetDate ? 'selected' : ''}>仅看：${d}</option>`).join('')}
-            </select>
-          ` : ''}
+          <span class="pill pill-blue">${U.escHtml(state.sourceLabel || '等待同步 HJF 历史出库底表')}</span>
+        </div>
+        <div class="toolbar" style="margin-bottom:4px;">
+          <span style="font-weight:600;color:#334155;">📅 核对日期区间：</span>
+          <select id="p-date-start" title="起始业务日期">
+            <option value="">全部开始</option>
+            ${state.availDates.map(d => `<option value="${d}" ${d === state.startDate ? 'selected' : ''}>${d}</option>`).join('')}
+          </select>
+          <span style="color:#64748b;">至</span>
+          <select id="p-date-end" title="结束业务日期">
+            <option value="">全部结束</option>
+            ${state.availDates.map(d => `<option value="${d}" ${d === state.endDate ? 'selected' : ''}>${d}</option>`).join('')}
+          </select>
+          <span style="font-size:11.5px;color:#64748b;">（单日选同一天，多日如 27~28 号选起止日即可，拖入带日期的 PDF 也会自动锁定）</span>
           <span style="flex:1"></span>
-          <button class="btn btn-success" id="p-copy-missing" ${!missing.length ? 'disabled' : ''}>📋 复制未核对缺单清单 (${missing.length})</button>
+          <button class="btn btn-success" id="p-copy-missing" ${!missing.length ? 'disabled' : ''}>📋 复制缺单催办清单 (${missing.length})</button>
         </div>
         <div id="p-scan-log" style="font-size:12px;color:#0369a1;margin-top:2px;">${U.escHtml(state.scanLog)}</div>
       </div>
@@ -590,32 +722,35 @@
           ${curPage ? `
             <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#475569;margin-bottom:6px;flex-wrap:wrap;gap:6px;">
               <span><b>第 ${curPage.pageNum} 页</b> · ${U.escHtml(curPage.fileName)}</span>
-              <span>${curPage.docs && curPage.docs.length ? `<span class="pill pill-green">检出单号：${curPage.docs.map(d => '…' + d.slice(-6)).join(', ')}</span>` : '<span class="pill pill-orange">本页未自动检出单号</span>'}</span>
+              <span>
+                ${curPage.dates && curPage.dates.length ? `<span class="pill pill-blue">${curPage.dates.join(', ')}</span>` : ''}
+                ${curPage.codes && curPage.codes.length ? `<span class="pill pill-green">检出 ${curPage.codes.length} 个编码</span>` : '<span class="pill pill-orange">未检出编码</span>'}
+              </span>
             </div>
             <div style="max-height:580px;overflow:auto;text-align:center;background:#0f172a;border-radius:8px;padding:6px;">
               <img src="${curPage.url}" style="max-width:100%;border-radius:4px;" />
             </div>
-          ` : `<div class="dropzone" id="p-media-drop">把当天的出库单扫描 PDF 拖到这里，平台将在后台自动识别单号/编码并核销右侧清单</div>`}
+          ` : `<div class="dropzone" id="p-media-drop">把对应日期（如 27 号或 27-28 号）的出库扫描 PDF 拖到这里，平台自动按 HJF 历史底表核对</div>`}
         </div>
 
         <div class="panel">
           <div class="panel-title">
-            <span>📑 右侧：单据核对区（每张单据独立核销）</span>
+            <span>📑 右侧：HJF 单据核对区（仅显示 [${U.escHtml(rangeLabel)}]）</span>
             <div style="display:flex;gap:5px;">
               <button class="btn-sm ${state.auditFilter === 'unmatched' ? 'btn-primary' : ''}" id="p-f-unmatched">🔴 未检索到 (${missing.length})</button>
-              <button class="btn-sm ${state.auditFilter === 'auto' ? 'btn-primary' : ''}" id="p-f-done">✅ 已核对 (${autoDone + manualDone})</button>
+              <button class="btn-sm ${state.auditFilter === 'done' ? 'btn-primary' : ''}" id="p-f-done">✅ 已核对 (${autoDone + manualDone})</button>
               <button class="btn-sm ${state.auditFilter === 'all' ? 'btn-primary' : ''}" id="p-f-all">全部 (${total})</button>
             </div>
           </div>
           <div style="max-height:600px;overflow-y:auto;padding-right:4px;">
-            ${listToShow.length === 0 ? `<div class="empty-cell">${total === 0 ? '请先导入当天出库清单（支持 ERP 材料出库单列表 或 HJF 总账）' : '🎉 当前筛选下没有未核对单据！'}</div>` :
+            ${listToShow.length === 0 ? `<div class="empty-cell">${total === 0 ? '请点上方「🔄 同步 HJF 历史出库底表」或拖入《HJF物资出库总账.xlsx》' : '🎉 当前日期区间所有 HJF 单据均已核对完成！'}</div>` :
               listToShow.map(t => `
                 <div class="photo-card ${t.checked ? 'checked' : 'missing'}" style="cursor:default;">
                   <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:5px;">
                     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                       <b style="font-size:13px;">${t.checked ? '✅' : '🔴'} ${U.escHtml(t.dept)}</b>
                       ${t.tag ? `<span class="pill pill-blue">${U.escHtml(t.tag)}</span>` : ''}
-                      <span style="font-size:11.5px;color:#64748b;" title="${U.escHtml(t.docNo || '')}">单号 ${U.escHtml(t.shortDoc)}${t.date ? ' · ' + t.date : ''}</span>
+                      <span style="font-size:11.5px;color:#64748b;">${U.escHtml(t.date || '')}${t.rec ? ' · ' + U.escHtml(t.rec) : ''}</span>
                     </div>
                     <div style="display:flex;gap:5px;align-items:center;">
                       ${t.matchedPage ? `<button class="btn-sm p-jump-page" data-page="${t.matchedPage}" title="跳转到左侧 PDF 对应页复查">👁 第${t.matchedPage}页</button>` : ''}
@@ -635,15 +770,20 @@
       </div>
     `;
 
+    root.querySelector('#p-sync-hjf').onclick = async () => {
+      await syncFromHjfLedger(false);
+      renderModule(root);
+    };
+
     const inCsv = root.querySelector('#p-in-csv');
     root.querySelector('#p-up-csv').onclick = () => inCsv.click();
     inCsv.onchange = async e => {
       if (!e.target.files[0]) return;
       try {
-        await loadTicketsFile(e.target.files[0]);
+        await loadHjfExcelFile(e.target.files[0]);
         renderModule(root);
       } catch (err) {
-        U.toast('出库清单解析失败：' + err.message, 'error');
+        U.toast('HJF 出库表解析失败：' + err.message, 'error');
       }
       e.target.value = '';
     };
@@ -667,10 +807,24 @@
       if (files.length) startBackgroundPdfAudit(files);
     };
 
-    const selDate = root.querySelector('#p-date-sel');
-    if (selDate) {
-      selDate.onchange = e => { state.targetDate = e.target.value; persistState(); renderModule(root); };
-    }
+    root.querySelector('#p-date-start').onchange = e => {
+      state.startDate = e.target.value;
+      if (!state.endDate || (state.startDate && state.endDate < state.startDate)) {
+        state.endDate = state.startDate;
+      }
+      if (state.pdfPages.length > 0) runAutoMatchScoped();
+      persistState();
+      renderModule(root);
+    };
+    root.querySelector('#p-date-end').onchange = e => {
+      state.endDate = e.target.value;
+      if (!state.startDate || (state.endDate && state.startDate > state.endDate)) {
+        state.startDate = state.endDate;
+      }
+      if (state.pdfPages.length > 0) runAutoMatchScoped();
+      persistState();
+      renderModule(root);
+    };
 
     root.querySelector('#p-only-unmatched-pdf').onchange = e => {
       state.onlyUnmatchedPages = e.target.checked;
@@ -681,118 +835,50 @@
     root.querySelector('#m-next').onclick = () => { state.activePageIdx = Math.min(visiblePages.length - 1, state.activePageIdx + 1); renderModule(root); };
 
     root.querySelector('#p-f-unmatched').onclick = () => { state.auditFilter = 'unmatched'; renderModule(root); };
-    root.querySelector('#p-f-done').onclick = () => { state.auditFilter = 'auto'; renderModule(root); };
+    root.querySelector('#p-f-done').onclick = () => { state.auditFilter = 'done'; renderModule(root); };
     root.querySelector('#p-f-all').onclick = () => { state.auditFilter = 'all'; renderModule(root); };
 
-    // 每张单据独立手动确认 / 撤销，绝不会误点全选
     root.querySelectorAll('.p-toggle-one').forEach(btn => {
       btn.onclick = e => {
         e.stopPropagation();
         const tid = Number(btn.dataset.tid);
         const t = state.tickets.find(x => x.id === tid);
         if (!t) return;
-        if (t.checked) {
-          t.checked = false;
-          t.matchType = '';
-        } else {
-          t.checked = true;
-          t.matchType = 'manual';
-        }
+        if (t.checked) { t.checked = false; t.matchType = ''; }
+        else { t.checked = true; t.matchType = 'manual'; }
         persistState();
         renderModule(root);
       };
     });
 
-    // 点击「第X页」直接跳到左侧对应 PDF 页面复查
     root.querySelectorAll('.p-jump-page').forEach(btn => {
       btn.onclick = e => {
         e.stopPropagation();
         const targetPageNum = Number(btn.dataset.page);
         state.onlyUnmatchedPages = false;
         const idx = state.pdfPages.findIndex(p => p.pageNum === targetPageNum);
-        if (idx >= 0) {
-          state.activePageIdx = idx;
-          renderModule(root);
-        }
+        if (idx >= 0) { state.activePageIdx = idx; renderModule(root); }
       };
     });
 
     root.querySelector('#p-copy-missing').onclick = async () => {
-      const lines = missing.map(t => `${t.dept} | ${t.tag || t.wh} | ${t.docNo || t.shortDoc} | ` + t.items.map(i => `${i.name}(${i.qty}${i.unit})`).join('、'));
+      const lines = missing.map(t => `${t.date || ''} | ${t.dept} | ${t.tag || t.wh} | ` + t.items.map(i => `${i.name}(${i.qty}${i.unit})`).join('、'));
       const ok = await U.copyText(lines.join('\n'));
-      U.toast(ok ? `已复制 ${lines.length} 张未核对缺单明细` : '复制失败，请检查剪贴板权限', ok ? 'success' : 'error');
+      U.toast(ok ? `已复制 ${lines.length} 张未核对 HJF 缺单明细` : '复制失败，请检查剪贴板权限', ok ? 'success' : 'error');
     };
-  }
-
-  /** 从【16列精简与自取】导出时自动承接清单（第一天导出自动留存，第二天直接拖 PDF 即可核对） */
-  function syncFrom16ColRows(mainRows, sourceName) {
-    const docGroups = new Map();
-    const dateSet = new Set();
-    for (const r of (mainRows || [])) {
-      const docNo = U.cleanStr(r[1]).toUpperCase();
-      const name = U.cleanStr(r[7]);
-      if (!docNo || !name) continue;
-      if (GAS_KEYWORDS.some(g => name.includes(g))) continue;
-
-      const dateStr = U.formatDate(r[2]);
-      if (dateStr) dateSet.add(dateStr);
-      const wh = U.cleanStr(r[3]);
-      const dept = U.cleanStr(r[5]) || '未知车间';
-      const code = U.formatCode(r[6]);
-      const unit = U.cleanStr(r[8]);
-      const qty = U.fmtNum(r[9]);
-      const rem = U.cleanStr(r[10]);
-      const lrem = U.cleanStr(r[11]);
-
-      if (!docGroups.has(docNo)) {
-        const isSelf = `${rem} ${lrem}`.includes('自取');
-        docGroups.set(docNo, {
-          id: docGroups.size + 1,
-          docNo,
-          shortDoc: docNo.length > 8 ? `…${docNo.slice(-6)}` : docNo,
-          date: dateStr,
-          dept,
-          rec: rem,
-          wh,
-          tag: isSelf ? `${wh}（自取）` : wh,
-          items: [],
-          checked: false,
-          matchType: '',
-          matchedPage: 0
-        });
-      }
-      docGroups.get(docNo).items.push({ code, name, qty, unit });
-    }
-
-    const tickets = [];
-    docGroups.forEach(t => { if (t.items.length > 0) tickets.push(t); });
-
-    state.tickets = tickets;
-    state.availDates = Array.from(dateSet).sort().reverse();
-    state.targetDate = '';
-    state.sheetName = `自动承接16列导出`;
-    state.sourceName = sourceName || '16列导出清单';
-    state.parseMode = 'erp_doc';
-    state.auditFilter = 'unmatched';
-    state.pdfPages = [];
-    state.activePageIdx = 0;
-    state.scanLog = `📌 已自动承接【16列精简与自取】导出清单（${tickets.length} 张非气体独立单据），明天直接拖入出库扫描 PDF 即可自动核对！`;
-    state._hydrated = true;
-    persistState();
-    refreshIfVisible();
-    return tickets.length;
   }
 
   WB.register({
     id: 'mod_photo_check',
     icon: '📑',
     title: '出库PDF核对',
-    syncFrom16Col: syncFrom16ColRows,
     async mount(container) {
       this._root = container;
       activeRoot = container;
       renderModule(container);
       await hydrateState();
+      // 每次切进本板块，自动静默从同源 HJF「2. 历史出库底表」拉取最新出库记录（不覆盖当次手动导入的总账文件）
+      if (!state.manualFileLoaded) await syncFromHjfLedger(true);
       if (activeRoot === container && container.isConnected) {
         renderModule(container);
       }
@@ -800,7 +886,7 @@
     async handleIncomingFiles(files) {
       const excels = files.filter(f => /\.(xlsx?|csv)$/i.test(f.name));
       const pdfs = files.filter(f => /\.pdf$/i.test(f.name));
-      if (excels.length) await loadTicketsFile(excels[0]);
+      if (excels.length) await loadHjfExcelFile(excels[0]);
       if (pdfs.length) startBackgroundPdfAudit(pdfs);
       refreshIfVisible();
     }
