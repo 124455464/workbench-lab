@@ -483,8 +483,8 @@
       const start = (curPage - 1) * pageSize;
       const slice = rows.slice(start, start + pageSize);
 
-      let html = `<div class="table-wrap"><table class="data-table"><thead><tr><th class="col-idx">#</th>`;
-      headers.forEach(h => { html += `<th>${Utils.escHtml(h)}</th>`; });
+      let html = `<div class="table-wrap"><table class="data-table"><thead><tr><th class="col-idx" title="点击全选当前页">#</th>`;
+      headers.forEach((h, cIdx) => { html += `<th class="col-hdr" data-c="${cIdx}" title="单击选中整列，可直接 Ctrl+C 复制">${Utils.escHtml(h)}</th>`; });
       html += `</tr></thead><tbody>`;
 
       if (slice.length === 0) {
@@ -493,11 +493,11 @@
         slice.forEach((row, i) => {
           const absIdx = start + i;
           const cls = rowClassFn ? rowClassFn(row, absIdx) : '';
-          html += `<tr class="${cls}"><td class="col-idx">${absIdx + 1}</td>`;
+          html += `<tr class="${cls}"><td class="col-idx" data-r="${i}" title="单击选中整行">${absIdx + 1}</td>`;
           headers.forEach((_, cIdx) => {
             const val = row[cIdx] ?? '';
             const rendered = cellRenderFn ? cellRenderFn(val, row, absIdx, cIdx) : Utils.escHtml(val);
-            html += `<td>${rendered}</td>`;
+            html += `<td data-r="${i}" data-c="${cIdx}">${rendered}</td>`;
           });
           html += `</tr>`;
         });
@@ -505,8 +505,9 @@
       html += `</tbody></table></div>`;
 
       html += `<div class="pager-bar">
-        <span class="pager-info">共 <b>${total}</b> 行（内存全量保留，当前仅渲染第 ${total ? start + 1 : 0}–${Math.min(start + pageSize, total)} 行防卡顿）</span>
+        <span class="pager-info">共 <b>${total}</b> 行（当前第 ${total ? start + 1 : 0}–${Math.min(start + pageSize, total)} 行 · <b>左键拖动框选 / 点表头选整列 / 点行号选整行，直接 Ctrl+C 复制</b>）</span>
         <div class="pager-btns">
+          <button class="btn-sm btn-copy-sel" style="display:none;background:#059669;color:#fff;border-color:#059669;">📋 复制选中区域</button>
           <button class="btn-sm" data-pg="1" ${curPage <= 1 ? 'disabled' : ''}>首页</button>
           <button class="btn-sm" data-pg="${curPage - 1}" ${curPage <= 1 ? 'disabled' : ''}>上一页</button>
           <span class="pager-cur">第 ${curPage} / ${totalPages} 页</span>
@@ -521,6 +522,140 @@
           if (onPageChange) onPageChange(Number(btn.dataset.pg));
         });
       });
+
+      // HJF 同款 Excel 框选 + 单击选整列/整行 + Ctrl+C 直接复制选中区域
+      if (slice.length > 0 && typeof document !== 'undefined') {
+        const tbl = container.querySelector('table.data-table');
+        const copySelBtn = container.querySelector('.btn-copy-sel');
+        let sel = null; // { r1, c1, r2, c2 }
+        let dragging = false;
+
+        const getBounds = () => {
+          if (!sel) return null;
+          return {
+            rMin: Math.min(sel.r1, sel.r2),
+            rMax: Math.max(sel.r1, sel.r2),
+            cMin: Math.min(sel.c1, sel.c2),
+            cMax: Math.max(sel.c1, sel.c2)
+          };
+        };
+
+        const paintSel = () => {
+          const b = getBounds();
+          tbl.querySelectorAll('td.cell-sel').forEach(el => el.classList.remove('cell-sel'));
+          tbl.querySelectorAll('th.col-hdr-sel').forEach(el => el.classList.remove('col-hdr-sel'));
+          if (!b) {
+            if (copySelBtn) copySelBtn.style.display = 'none';
+            return;
+          }
+          const rowsCount = b.rMax - b.rMin + 1;
+          const colsCount = b.cMax - b.cMin + 1;
+          for (let r = b.rMin; r <= b.rMax; r++) {
+            const tr = tbl.tBodies[0] && tbl.tBodies[0].rows[r];
+            if (!tr) continue;
+            for (let c = b.cMin; c <= b.cMax; c++) {
+              const td = tr.cells[c + 1];
+              if (td) td.classList.add('cell-sel');
+            }
+          }
+          if (b.rMin === 0 && b.rMax === slice.length - 1) {
+            for (let c = b.cMin; c <= b.cMax; c++) {
+              const th = tbl.tHead && tbl.tHead.rows[0] && tbl.tHead.rows[0].cells[c + 1];
+              if (th) th.classList.add('col-hdr-sel');
+            }
+          }
+          if (copySelBtn) {
+            copySelBtn.style.display = 'inline-block';
+            copySelBtn.textContent = `📋 复制选中 (${rowsCount}行×${colsCount}列)`;
+          }
+        };
+
+        const copySelection = async () => {
+          const b = getBounds();
+          if (!b) return false;
+          const subRows = [];
+          for (let r = b.rMin; r <= b.rMax; r++) {
+            const row = slice[r] || [];
+            const outRow = [];
+            for (let c = b.cMin; c <= b.cMax; c++) outRow.push(row[c] ?? '');
+            subRows.push(outRow);
+          }
+          await Utils.copyAsTSV([], subRows, false);
+          Utils.toast(`已复制选中的 ${b.rMax - b.rMin + 1} 行 × ${b.cMax - b.cMin + 1} 列区域（可直接 Ctrl+V 粘贴到 Excel）`, 'success');
+          return true;
+        };
+
+        if (copySelBtn) copySelBtn.addEventListener('click', () => { copySelection(); });
+
+        const registerActiveTable = () => {
+          global._wbActiveTableCopy = () => (container.isConnected && sel ? copySelection() : false);
+        };
+
+        tbl.addEventListener('mousedown', e => {
+          if (e.button !== 0) return;
+          const td = e.target.closest('td[data-r][data-c]');
+          if (td) {
+            const r = Number(td.dataset.r), c = Number(td.dataset.c);
+            sel = e.shiftKey && sel ? { r1: sel.r1, c1: sel.c1, r2: r, c2: c } : { r1: r, c1: c, r2: r, c2: c };
+            dragging = true;
+            registerActiveTable();
+            paintSel();
+            return;
+          }
+          const th = e.target.closest('th.col-hdr[data-c]');
+          if (th) {
+            const c = Number(th.dataset.c);
+            sel = e.shiftKey && sel
+              ? { r1: 0, c1: sel.c1, r2: slice.length - 1, c2: c }
+              : { r1: 0, c1: c, r2: slice.length - 1, c2: c };
+            registerActiveTable();
+            paintSel();
+            return;
+          }
+          const rIdx = e.target.closest('td.col-idx[data-r]');
+          if (rIdx) {
+            const r = Number(rIdx.dataset.r);
+            sel = e.shiftKey && sel
+              ? { r1: sel.r1, c1: 0, r2: r, c2: headers.length - 1 }
+              : { r1: r, c1: 0, r2: r, c2: headers.length - 1 };
+            registerActiveTable();
+            paintSel();
+            return;
+          }
+          if (e.target.closest('th.col-idx')) {
+            sel = { r1: 0, c1: 0, r2: slice.length - 1, c2: headers.length - 1 };
+            registerActiveTable();
+            paintSel();
+          }
+        });
+
+        tbl.addEventListener('mouseover', e => {
+          if (!dragging || !sel) return;
+          const td = e.target.closest('td[data-r][data-c]');
+          if (!td) return;
+          sel.r2 = Number(td.dataset.r);
+          sel.c2 = Number(td.dataset.c);
+          paintSel();
+        });
+
+        if (!global._wbTableGlobalBound) {
+          global._wbTableGlobalBound = true;
+          document.addEventListener('mouseup', () => { global._wbTableMouseUp && global._wbTableMouseUp(); });
+          document.addEventListener('keydown', e => {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+              const tag = (document.activeElement && document.activeElement.tagName || '').toLowerCase();
+              if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+              const winSel = window.getSelection ? String(window.getSelection()) : '';
+              if (winSel && winSel.trim().length > 0) return;
+              if (typeof global._wbActiveTableCopy === 'function') {
+                const handled = global._wbActiveTableCopy();
+                if (handled) e.preventDefault();
+              }
+            }
+          });
+        }
+        global._wbTableMouseUp = () => { dragging = false; };
+      }
     },
 
     toast(msg, type = 'info') {

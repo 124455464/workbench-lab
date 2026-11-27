@@ -123,7 +123,11 @@
     .data-table tr.row-warn td { background: #fffbeb; }
     .data-table tr.row-ok td { background: #f0fdf4; }
     .data-table tr.row-err td { background: #fef2f2; }
-    .col-idx { color: var(--muted); text-align: center !important; width: 42px; background: #f8fafc; }
+    .data-table td.cell-sel { background: #dbeafe !important; outline: 1px solid #3b82f6; outline-offset: -1px; user-select: none; }
+    .data-table th.col-hdr { cursor: pointer; user-select: none; }
+    .data-table th.col-hdr:hover { background: #e2e8f0; }
+    .data-table th.col-hdr-sel { background: #bfdbfe !important; color: #1d4ed8; }
+    .col-idx { color: var(--muted); text-align: center !important; width: 42px; background: #f8fafc; cursor: pointer; user-select: none; }
     .empty-cell { text-align: center; color: var(--muted); padding: 28px !important; }
     .pager-bar {
       display: flex; justify-content: space-between; align-items: center; margin-top: 8px;
@@ -284,7 +288,7 @@
   <div id="wb-toast-box"></div>
 
   <!-- 核心公共库 -->
-  <script src="./core_utils.js?v=20261126d"></script>
+  <script src="./core_utils.js?v=20261126e"></script>
   <!-- 7 大独立隔离业务模块（任一模块升级或出错，其余模块 100% 不受影响） -->
   <script src="./modules/mod_hjf_embed.js?v=20261126"></script>
   <script src="./modules/mod_16col_yellow.js?v=20261126h"></script>
@@ -292,7 +296,7 @@
   <script src="./modules/mod_photo_check.js?v=20261126h"></script>
   <script src="./modules/mod_stagnant.js?v=20261126c"></script>
   <script src="./modules/mod_ost.js?v=20261126j"></script>
-  <script src="./modules/mod_laobao.js?v=20261126q"></script>
+  <script src="./modules/mod_laobao.js?v=20261126r"></script>
 
   <script>
     (function () {

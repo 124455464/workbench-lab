@@ -373,6 +373,48 @@
     }).join('；');
   }
 
+  /** 核对「已命中ID」的人员姓名是否与花名册完全一致：仅完全一致直接通过，拼写错/简称/绰号/张冠李戴均写入问题人员 */
+  function checkNameMismatch(workshopName, rosterName, isCn, idRaw) {
+    const wClean = U.cleanStr(workshopName);
+    const rClean = U.cleanStr(rosterName);
+    if (!wClean || !rClean) return null;
+
+    if (isCn) {
+      const wCn = extractPureChineseName(wClean);
+      const rCn = extractPureChineseName(rClean);
+      if (wCn && rCn && wCn === rCn) return null; // 中文姓名完全一致，直接通过
+      if (wClean.toUpperCase() === rClean.toUpperCase()) return null;
+      // 判断是近似/错字还是完全不同人
+      const isApprox = wCn && rCn && (
+        wCn.includes(rCn) || rCn.includes(wCn) ||
+        (wCn.length === rCn.length && [...wCn].filter((ch, i) => ch === rCn[i]).length >= wCn.length - 1)
+      );
+      return isApprox
+        ? { type: '姓名拼写/近似不符', desc: `ID匹配，但车间填「${wClean}」，花名册原名「${rClean}」` }
+        : { type: 'ID与姓名不符', desc: `ID ${idRaw} 在花名册对应「${rClean}」，与车间填「${wClean}」不符` };
+    } else {
+      // 印方：若车间带了中文绰号（如 EDIKA WAMI艾迪），即便英文一致也提示近似不符让人工看车间是否规范填报
+      const hasCnSuffix = /[\u4e00-\u9fa5]/.test(wClean);
+      const wTok = extractLatinTokens(wClean);
+      const rTok = extractLatinTokens(rClean);
+      const wFlat = wTok.join(' ');
+      const rFlat = rTok.join(' ');
+      if (!hasCnSuffix && wFlat && rFlat && wFlat === rFlat) return null; // 英文全名完全一致，直接通过
+
+      // 判断是简称/绰号/拼写近似还是完全不同人
+      let matchedCnt = 0;
+      for (const wt of wTok) {
+        if (rTok.includes(wt) || rTok.some(rt => (wt.length >= 4 && rt.length >= 4 && (rt.includes(wt) || wt.includes(rt))) || (wt.length >= 4 && editDistance(wt, rt) <= 2))) {
+          matchedCnt++;
+        }
+      }
+      const isApprox = matchedCnt > 0;
+      return isApprox
+        ? { type: '姓名拼写/近似不符', desc: `ID匹配，但车间填「${wClean}」，花名册原名「${rClean}」` }
+        : { type: 'ID与姓名不符', desc: `NIK ${idRaw} 在花名册对应「${rClean}」，与车间填「${wClean}」不符` };
+    }
+  }
+
   /* ==================== 中/印双花名册核对 ==================== */
   function auditSinglePerson(p, fileName, expectedCompany) {
     const hasCnRoster = Object.keys(state.cnById).length > 0 || Object.keys(state.cnByName).length > 0;
@@ -401,6 +443,9 @@
           } else if (hit.company !== '未知' && hit.company !== expectedCompany) {
             issueType = `串公司(${hit.company})`;
             issueDesc = `中方花名册归属 ${hit.company}（${hit.dept} / ${hit.workshop}）`;
+          } else {
+            const nm = checkNameMismatch(name, hit.name, true, idRaw);
+            if (nm) { issueType = nm.type; issueDesc = nm.desc; }
           }
         } else {
           const idFallback = hasIdRoster ? state.idByNik[idRaw] : null;
@@ -411,6 +456,9 @@
             } else if (idFallback.status && !/aktif|active|在职/i.test(idFallback.status)) {
               issueType = `印方非在职(${idFallback.status})`;
               issueDesc = `印方花名册状态为 ${idFallback.status}`;
+            } else {
+              const nm = checkNameMismatch(name, idFallback.name, false, idRaw);
+              if (nm) { issueType = nm.type; issueDesc = nm.desc; }
             }
           } else {
             const pureCn = extractPureChineseName(name);
@@ -449,6 +497,9 @@
           } else if (hit.status && !/aktif|active|在职/i.test(hit.status)) {
             issueType = `印方非在职(${hit.status})`;
             issueDesc = `印方花名册状态为 ${hit.status}`;
+          } else {
+            const nm = checkNameMismatch(name, hit.name, false, idRaw);
+            if (nm) { issueType = nm.type; issueDesc = nm.desc; }
           }
         } else {
           const fuzzy = findFuzzyIdMatches(name, idRaw);
