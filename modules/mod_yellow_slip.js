@@ -48,6 +48,7 @@
     const el = document.getElementById('wb-bg-pill');
     if (!el) return;
     if (!show) { el.style.display = 'none'; return; }
+    el.dataset.targetMod = 'mod_yellow_slip';
     el.style.display = 'inline-block';
     el.style.background = done ? '#15803d' : '#1d4ed8';
     el.style.color = done ? '#dcfce7' : '#dbeafe';
@@ -615,7 +616,7 @@
         return '';
       },
       cellRenderFn: (val, row, absIdx, cIdx) => {
-        if (cIdx === 13 && val === '是') return `<span class="pill pill-green">是（已回收）</span>`;
+        if (cIdx === 13 && val === '是') return `<span class="pill pill-green">是</span>`;
         if (cIdx === 13 && val) return `<span class="pill pill-orange">${U.escHtml(val)}</span>`;
         if (cIdx === 13 && row[12] === '是') return `<span style="color:#dc2626;font-weight:600;">待回收</span>`;
         return U.escHtml(val);

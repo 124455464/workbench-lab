@@ -288,8 +288,8 @@
   <!-- 7 大独立隔离业务模块（任一模块升级或出错，其余模块 100% 不受影响） -->
   <script src="./modules/mod_hjf_embed.js?v=20261126"></script>
   <script src="./modules/mod_16col_yellow.js?v=20261124"></script>
-  <script src="./modules/mod_yellow_slip.js?v=20261126"></script>
-  <script src="./modules/mod_photo_check.js?v=20261126"></script>
+  <script src="./modules/mod_yellow_slip.js?v=20261126e"></script>
+  <script src="./modules/mod_photo_check.js?v=20261126e"></script>
   <script src="./modules/mod_stagnant.js?v=20261126b"></script>
   <script src="./modules/mod_ost.js?v=20261124"></script>
   <script src="./modules/mod_laobao.js?v=20261124b"></script>
@@ -528,7 +528,7 @@
 
       const bgPill = document.getElementById('wb-bg-pill');
       if (bgPill) {
-        bgPill.onclick = () => switchTab('mod_yellow_slip');
+        bgPill.onclick = () => switchTab(bgPill.dataset.targetMod || 'mod_yellow_slip');
       }
 
       // 绑定分板块独立格式刷弹窗（支持直接 Ctrl+V 粘贴单元格自动识别格式）
