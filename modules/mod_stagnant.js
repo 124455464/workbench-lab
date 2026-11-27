@@ -6,8 +6,59 @@
   'use strict';
   const U = WB.Utils;
 
+  const SCHEMA_VER = 2;
+
   function deepCloneSheets(obj) {
     return JSON.parse(JSON.stringify(obj || {}));
+  }
+
+  function parseChineseNum(str) {
+    const s = String(str || '').trim();
+    if (/^\d+$/.test(s)) return parseInt(s, 10);
+    const map = { '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+    if (s === '十') return 10;
+    if (s.includes('十')) {
+      const [l, r] = s.split('十');
+      const tens = l ? (map[l] || 0) : 1;
+      const ones = r ? (map[r] || 0) : 0;
+      return tens * 10 + ones;
+    }
+    return map[s] || 0;
+  }
+
+  function toChineseNum(n) {
+    const d = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+    if (n <= 0) return String(n);
+    if (n < 10) return d[n];
+    if (n === 10) return '十';
+    if (n < 20) return '十' + d[n % 10];
+    if (n < 100) {
+      const t = Math.floor(n / 10);
+      const o = n % 10;
+      return d[t] + '十' + (o ? d[o] : '');
+    }
+    return String(n);
+  }
+
+  /** 自动读取留存底表的最大出库轮次，严格顺延生成下一轮列名（如 第十次出库数量 -> 第十一次出库数量） */
+  function detectNextRoundTitle(sheetsObj) {
+    let maxRound = 0;
+    let hasPlainFirst = false;
+    Object.entries(sheetsObj || {}).forEach(([sn, sh]) => {
+      if (sn.includes('消耗') || sn.includes('统计')) return;
+      (sh.headers || []).forEach(h => {
+        const s = U.cleanStr(h);
+        const m = s.match(/第([一二三四五六七八九十两\d]+)次出库/);
+        if (m) {
+          const num = parseChineseNum(m[1]);
+          if (num > maxRound) maxRound = num;
+        } else if (s === '出库数量') {
+          hasPlainFirst = true;
+        }
+      });
+    });
+    const next = maxRound > 0 ? maxRound + 1 : (hasPlainFirst ? 2 : 1);
+    return `第${toChineseNum(next)}次出库数量`;
   }
 
   let state = {
@@ -31,6 +82,7 @@
 
   function persistState() {
     WB.Store.save('mod_stagnant', {
+      schemaVer: SCHEMA_VER,
       savedBaseSheets: state.savedBaseSheets,
       savedSheetNames: state.savedSheetNames,
       savedBaseLabel: state.savedBaseLabel,
@@ -49,9 +101,10 @@
 
   async function hydrateState() {
     const saved = await WB.Store.load('mod_stagnant');
-    if (saved) {
-      state.savedBaseSheets = saved.savedBaseSheets || saved.baseSheets || {};
-      state.savedSheetNames = saved.savedSheetNames || saved.sheetNames || [];
+    // 严格校验 schemaVer=2，自动丢弃旧版未分层的脏缓存（防止旧版重复的“本期出库数量”污染留存底表）
+    if (saved && saved.schemaVer === SCHEMA_VER) {
+      state.savedBaseSheets = saved.savedBaseSheets || {};
+      state.savedSheetNames = saved.savedSheetNames || [];
       state.savedBaseLabel = saved.savedBaseLabel || (state.savedSheetNames.length ? '上次留存底表' : '');
       state.autoSaveOnExport = saved.autoSaveOnExport !== undefined ? !!saved.autoSaveOnExport : true;
       state.baseSheets = saved.baseSheets || deepCloneSheets(state.savedBaseSheets);
@@ -61,7 +114,7 @@
       state.flowFileName = saved.flowFileName || '';
       state.flowCount = saved.flowCount || 0;
       state.matchedCount = saved.matchedCount || 0;
-      state.periodLabel = saved.periodLabel || '';
+      state.periodLabel = saved.periodLabel || (state.savedSheetNames.length ? detectNextRoundTitle(state.savedBaseSheets) : '');
       state.consumeLog = saved.consumeLog || [];
     }
   }
@@ -99,6 +152,7 @@
     const sheets = {};
     const names = [];
     parsed.sheetNames.forEach(sn => {
+      if (sn === '本期消耗量统计') return; // 跳过临时单期统计页
       const aoa = parsed.sheets[sn] || [];
       if (aoa.length < 2) return;
       if (/Sheet\d+/i.test(sn) && aoa.length <= 2) return;
@@ -108,7 +162,7 @@
         rows: aoa.slice(1).map(r => r.map(v => U.cleanStr(v)))
       };
     });
-    // 同时设为留存默认基线 + 当前工作表
+    // 同时设为留存默认基线 + 当前工作表，并自动推算下一轮列名（如 第十一次出库数量）
     state.savedBaseSheets = deepCloneSheets(sheets);
     state.savedSheetNames = [...names];
     state.savedBaseLabel = file.name;
@@ -120,9 +174,10 @@
     state.flowCount = 0;
     state.matchedCount = 0;
     state.consumeLog = [];
+    state.periodLabel = detectNextRoundTitle(sheets);
     state.page = 1;
     persistState();
-    U.toast(`已载入并留存默认底表：${file.name}（后续直接拖入材料出库单即可反复筛选）`, 'success');
+    U.toast(`已留存默认底表：${file.name}（下一轮自动顺延为【${state.periodLabel}】）`, 'success');
   }
 
   function resetToSavedBase() {
@@ -135,6 +190,24 @@
     state.flowCount = 0;
     state.matchedCount = 0;
     state.consumeLog = [];
+    state.periodLabel = detectNextRoundTitle(state.savedBaseSheets);
+    state.page = 1;
+    persistState();
+  }
+
+  function clearSavedBase() {
+    state.savedBaseSheets = {};
+    state.savedSheetNames = [];
+    state.savedBaseLabel = '';
+    state.baseSheets = {};
+    state.sheetNames = [];
+    state.activeSheet = '';
+    state.hasPendingRun = false;
+    state.flowFileName = '';
+    state.flowCount = 0;
+    state.matchedCount = 0;
+    state.consumeLog = [];
+    state.periodLabel = '';
     state.page = 1;
     persistState();
   }
@@ -172,7 +245,9 @@
       : fh.findIndex(h => /单位/.test(h) && !/领用单位|组织/.test(h));
     if (iCode < 0 || iQty < 0) throw new Error('流水账未找到物料编码或数量列');
 
-    const colTitle = state.periodLabel.trim() || `本期出库数量`;
+    const autoNext = detectNextRoundTitle(state.savedBaseSheets);
+    const colTitle = (state.periodLabel || '').trim() || autoNext;
+    state.periodLabel = colTitle;
     const flowByWhCode = new Map();
     let flowCount = 0;
     const rawFlowEntries = [];
@@ -339,6 +414,7 @@
           <button class="btn" id="s-up-base">📂 ${hasSavedBase ? '更换 / 手动导入新底表' : '导入初始呆滞品底表 (.xlsx)'}</button>
           <input type="file" id="s-in-base" accept=".xlsx,.xls" class="hidden-input" />
           ${state.hasPendingRun ? `<button class="btn btn-warning" id="s-reset-base" title="放弃当前试算结果，还原到上方留存默认底表">↩️ 还原到留存底表</button>` : ''}
+          ${hasSavedBase ? `<button class="btn btn-danger" id="s-clear-base" title="清空当前留存底表，重新导入干净底表">🗑️ 清空底表</button>` : ''}
           <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#0369a1;cursor:pointer;margin-left:6px;">
             <input type="checkbox" id="s-autosave-exp" ${state.autoSaveOnExport ? 'checked' : ''} />
             导出总表时，自动将本次导出结果留存为下一次默认底表
@@ -358,7 +434,7 @@
           <div class="kpi-card orange"><div class="kpi-label">本期消耗量统计条数</div><div class="kpi-val">${state.consumeLog.length}</div></div>
         </div>
         <div class="toolbar">
-          <input type="text" id="s-period" value="${U.escHtml(state.periodLabel)}" placeholder="新列名，如：第十一次出库数量" style="width:220px;" />
+          <input type="text" id="s-period" value="${U.escHtml(state.periodLabel)}" placeholder="自动顺延轮次，如：第十一次出库数量" style="width:220px;" />
           <button class="btn btn-primary" id="s-up-flow">📥 导入材料出库单筛选（可重复拖入重算）</button>
           <input type="file" id="s-in-flow" accept=".xlsx,.xls,.csv" class="hidden-input" />
           <span style="flex:1"></span>
@@ -387,6 +463,14 @@
         resetToSavedBase();
         renderModule(root);
         U.toast('已还原到上次留存的默认底表', 'info');
+      };
+    }
+    const btnClear = root.querySelector('#s-clear-base');
+    if (btnClear) {
+      btnClear.onclick = () => {
+        clearSavedBase();
+        renderModule(root);
+        U.toast('已清空留存底表，请重新拖入干净底表', 'info');
       };
     }
 
@@ -432,20 +516,20 @@
           colWidths: [8, 12, 10, 8, 15, 28, 8, 12, 16]
         });
       }
-      const tag = state.periodLabel.trim() || '本期';
+      const tag = state.periodLabel.trim() || detectNextRoundTitle(state.savedBaseSheets);
       U.exportWorkbook(cfgs, `呆滞品核扣结果_${tag}.xlsx`);
 
-      // 导出后自动将本次定稿结果留存为下一次的默认底表！
+      // 导出后自动将本次定稿结果留存为下一次的默认底表，并自动顺延下一轮名称！
       if (state.autoSaveOnExport && state.hasPendingRun) {
         state.savedBaseSheets = deepCloneSheets(state.baseSheets);
         state.savedSheetNames = [...state.sheetNames];
         const ts = new Date().toTimeString().slice(0, 5);
         state.savedBaseLabel = `上次导出留存（${tag} · ${ts}）`;
         state.hasPendingRun = false;
-        state.periodLabel = '';
+        state.periodLabel = detectNextRoundTitle(state.savedBaseSheets);
         persistState();
         renderModule(root);
-        U.toast(`已导出并自动留存为下轮默认底表！下次直接拖材料出库单即可筛选下一轮`, 'success');
+        U.toast(`已导出并留存为默认底表！下轮已自动顺延为【${state.periodLabel}】`, 'success');
       } else {
         U.toast(`已导出呆滞品核扣结果_${tag}.xlsx`, 'success');
       }
