@@ -724,10 +724,70 @@
     };
   }
 
+  /** 从【16列精简与自取】导出时自动承接清单（第一天导出自动留存，第二天直接拖 PDF 即可核对） */
+  function syncFrom16ColRows(mainRows, sourceName) {
+    const docGroups = new Map();
+    const dateSet = new Set();
+    for (const r of (mainRows || [])) {
+      const docNo = U.cleanStr(r[1]).toUpperCase();
+      const name = U.cleanStr(r[7]);
+      if (!docNo || !name) continue;
+      if (GAS_KEYWORDS.some(g => name.includes(g))) continue;
+
+      const dateStr = U.formatDate(r[2]);
+      if (dateStr) dateSet.add(dateStr);
+      const wh = U.cleanStr(r[3]);
+      const dept = U.cleanStr(r[5]) || '未知车间';
+      const code = U.formatCode(r[6]);
+      const unit = U.cleanStr(r[8]);
+      const qty = U.fmtNum(r[9]);
+      const rem = U.cleanStr(r[10]);
+      const lrem = U.cleanStr(r[11]);
+
+      if (!docGroups.has(docNo)) {
+        const isSelf = `${rem} ${lrem}`.includes('自取');
+        docGroups.set(docNo, {
+          id: docGroups.size + 1,
+          docNo,
+          shortDoc: docNo.length > 8 ? `…${docNo.slice(-6)}` : docNo,
+          date: dateStr,
+          dept,
+          rec: rem,
+          wh,
+          tag: isSelf ? `${wh}（自取）` : wh,
+          items: [],
+          checked: false,
+          matchType: '',
+          matchedPage: 0
+        });
+      }
+      docGroups.get(docNo).items.push({ code, name, qty, unit });
+    }
+
+    const tickets = [];
+    docGroups.forEach(t => { if (t.items.length > 0) tickets.push(t); });
+
+    state.tickets = tickets;
+    state.availDates = Array.from(dateSet).sort().reverse();
+    state.targetDate = '';
+    state.sheetName = `自动承接16列导出`;
+    state.sourceName = sourceName || '16列导出清单';
+    state.parseMode = 'erp_doc';
+    state.auditFilter = 'unmatched';
+    state.pdfPages = [];
+    state.activePageIdx = 0;
+    state.scanLog = `📌 已自动承接【16列精简与自取】导出清单（${tickets.length} 张非气体独立单据），明天直接拖入出库扫描 PDF 即可自动核对！`;
+    state._hydrated = true;
+    persistState();
+    refreshIfVisible();
+    return tickets.length;
+  }
+
   WB.register({
     id: 'mod_photo_check',
     icon: '📑',
     title: '出库PDF核对',
+    syncFrom16Col: syncFrom16ColRows,
     async mount(container) {
       this._root = container;
       activeRoot = container;

@@ -211,7 +211,15 @@
         { name: '材料出库单列表', headers: HEADERS_16, rows: state.mainRows, textCols: [1, 2, 6, 15], numCols: [9], colWidths: COL_WIDTHS },
         { name: '自取物资', headers: HEADERS_16, rows: state.selfRows, textCols: [1, 2, 6, 15], numCols: [9], colWidths: COL_WIDTHS }
       ], outName);
-      U.toast('已导出：' + outName, 'success');
+
+      // 自动留存进【📑 出库PDF核对】，第二天只需直接拖入扫描 PDF 即可自动核对
+      const pdfMod = WB.modules && WB.modules.mod_photo_check;
+      if (pdfMod && typeof pdfMod.syncFrom16Col === 'function') {
+        const cnt = pdfMod.syncFrom16Col(state.mainRows, state.sourceName || outName);
+        U.toast(`已导出 ${outName}，并已自动留存 ${cnt} 张独立单据到【📑 出库PDF核对】！第二天直接拖 PDF 即可核对`, 'success');
+      } else {
+        U.toast('已导出：' + outName, 'success');
+      }
     };
 
     root.querySelector('#tab-main').onclick = () => { state.activeView = 'main'; state.page = 1; renderModule(root); };

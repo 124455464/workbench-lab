@@ -119,7 +119,8 @@
       const iName = findExactOrMatch(h, ['存货名称', '物料名称', '物资名称'], ['存货名', '物料名', '物资名', '名称'], /仓库|分类|货位|库位|组织|部门/);
       const iSpec = findExactOrMatch(h, ['规格型号', '规格'], ['规格']);
       const iWh = findExactOrMatch(h, ['仓库名称', '仓库'], ['仓库'], /编码|代码/);
-      const iLoc = findExactOrMatch(h, ['货位编码', '库位编码', '货位'], ['货位', '库位'], /名称/);
+      const iLoc = findExactOrMatch(h, ['货位编码', '库位编码', '货位代码'], ['货位编码', '库位编码', '货位'], /名称/);
+      const iLocName = findExactOrMatch(h, ['货位名称', '库位名称'], ['货位名', '库位名'], /编码|代码/);
       const iQty = findExactOrMatch(h, ['现存数量', '现存量', '可用数量', '结存主数量', '结存数量'], ['现存', '可用', '结存']);
 
       for (let i = hdrIdx + 1; i < aoa.length; i++) {
@@ -133,6 +134,7 @@
           spec: iSpec >= 0 ? U.cleanStr(r[iSpec]) : '',
           wh: iWh >= 0 ? U.cleanStr(r[iWh]) : sn,
           loc: iLoc >= 0 ? U.cleanStr(r[iLoc]) : '',
+          locName: iLocName >= 0 ? U.cleanStr(r[iLocName]) : '',
           qty: iQty >= 0 ? U.parseNum(r[iQty]) : 0
         };
         if (!map.has(code)) map.set(code, []);
@@ -144,7 +146,7 @@
     state.stockCount = count;
     if (state.dailyRawRows.length) rebuildDailyOutput();
     persistState();
-    U.toast(`现存量索引构建完成：${count} 条记录（${map.size} 个唯一编码，兼容 HTML 伪装 .xls）`, 'success');
+    U.toast(`现存量索引构建完成：${count} 条记录（${map.size} 个唯一编码，货位编码与货位名称已分离索引）`, 'success');
   }
 
   function activateDailySheet(sn) {
@@ -154,7 +156,8 @@
     state.dailyRawHeaders = sh.headers;
     state.dailyRawRows = sh.rows;
     state.dailyAvailDates = sh.availDates;
-    state.dailyTargetDate = '';
+    // 默认自动定位表内最新自然日（无需每次手动下拉挑选，仍可随时切换为其他日期或全部）
+    state.dailyTargetDate = sh.availDates && sh.availDates.length ? sh.availDates[0] : '';
     state.dailyPage = 1;
     rebuildDailyOutput();
   }
@@ -212,12 +215,13 @@
     state.dailyFileName = file.name;
     activateDailySheet(defaultSn);
     persistState();
-    U.toast(`OST 申报表载入成功：已定位最新表 [${defaultSn}]（${state.dailyRawRows.length} 行，共 ${validNames.length} 个工作表）`, 'success');
+    const dateTip = state.dailyTargetDate ? `，已自动筛选最新日期 ${state.dailyTargetDate}（${state.dailyFilteredRows.length} 行）` : `（${state.dailyRawRows.length} 行）`;
+    U.toast(`OST 申报表载入成功：表 [${defaultSn}]${dateTip}`, 'success');
   }
 
   function rebuildDailyOutput() {
     const baseH = [...state.dailyRawHeaders];
-    const appendCols = ['子项号', '用途编码', '货位编码'];
+    const appendCols = ['子项号', '用途编码', '货位编码', '货位名称'];
     appendCols.forEach(c => {
       if (!baseH.includes(c)) baseH.push(c);
     });
@@ -226,7 +230,8 @@
     const iCode = baseH.findIndex(h => h.includes('编码') && !h.includes('货位') && !h.includes('用途'));
     const iWh = baseH.findIndex(h => h.includes('仓库'));
     const iLoc = baseH.indexOf('货位编码');
-    const iAltLoc = baseH.findIndex((h, idx) => idx !== iLoc && h.includes('货位'));
+    const iLocName = baseH.indexOf('货位名称');
+    const iAltLoc = baseH.findIndex((h, idx) => idx !== iLoc && idx !== iLocName && h.includes('货位'));
 
     const target = state.dailyTargetDate.trim();
     const out = [];
@@ -241,15 +246,48 @@
         const normD = U.formatDate(row[iDate]);
         if (/^\d{4}-\d{2}-\d{2}$/.test(normD)) row[iDate] = normD;
       }
+
+      // 智能提取存货编码：优先取编码列；若个别行串列（如把“综合仓”填进编码列、真编码挤到下一列），自动横向兜底检索真实编码
+      let lookupCode = '';
       if (iCode >= 0) {
-        const code = U.formatCode(row[iCode]);
-        row[iCode] = code;
-        // 若已导入现存量且货位编码为空，自动补全货位
-        if (code && !row[iLoc] && state.stockMap.has(code)) {
-          const hits = state.stockMap.get(code);
-          const locs = Array.from(new Set(hits.map(h => h.loc).filter(Boolean)));
-          row[iLoc] = locs.join(' / ');
+        const c0 = U.formatCode(row[iCode]);
+        if (c0 && state.stockMap.has(c0)) {
+          row[iCode] = c0;
+          lookupCode = c0;
+        } else {
+          // 扫描同行相邻列，精准找回串列编码（如 1001P21484426 或 050107020）
+          for (let k = 0; k < rawRow.length; k++) {
+            const cand = U.formatCode(rawRow[k]);
+            if (cand && /^(?:1001P\d+|0[1-9]\d{6,10})$/i.test(cand) && state.stockMap.has(cand)) {
+              lookupCode = cand;
+              break;
+            }
+          }
+          if (!lookupCode && c0) row[iCode] = c0;
         }
+      }
+
+      // 从现存量补全全部有效货位（优先取正库存货位，严格分离「货位编码」与「货位名称」）
+      if (lookupCode && state.stockMap.has(lookupCode)) {
+        const allHits = state.stockMap.get(lookupCode) || [];
+        const posHits = allHits.filter(h => h.qty > 0);
+        const hits = posHits.length ? posHits : allHits;
+
+        const seenPairs = new Set();
+        const locCodes = [];
+        const locNames = [];
+        hits.forEach(h => {
+          const lc = U.cleanStr(h.loc);
+          const ln = U.cleanStr(h.locName);
+          if (!lc && !ln) return;
+          const pk = `${lc}||${ln}`;
+          if (seenPairs.has(pk)) return;
+          seenPairs.add(pk);
+          if (lc) locCodes.push(lc);
+          if (ln) locNames.push(ln);
+        });
+        if (!row[iLoc] && locCodes.length) row[iLoc] = locCodes.join(' / ');
+        if (!row[iLocName] && locNames.length) row[iLocName] = locNames.join(' / ');
       }
       out.push(row);
     }
@@ -257,7 +295,7 @@
     // 综合仓置顶 (0) -> 其他仓居中 (1) -> P3/P7/P9/110105/110110 沉底 (2)
     function getBucket(row) {
       const whTxt = iWh >= 0 ? (row[iWh] || '') : '';
-      const locTxt = `${row[iLoc] || ''} ${iAltLoc >= 0 ? row[iAltLoc] : ''} ${whTxt}`.toUpperCase();
+      const locTxt = `${row[iLoc] || ''} ${row[iLocName] || ''} ${iAltLoc >= 0 ? row[iAltLoc] : ''} ${whTxt}`.toUpperCase();
       if (/P3|P7|P9|110105|110110/.test(locTxt)) return 2;
       if (whTxt.includes('综合仓')) return 0;
       return 1;
