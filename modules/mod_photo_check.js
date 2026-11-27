@@ -13,9 +13,29 @@
 (function () {
   'use strict';
   const U = WB.Utils;
+  const SCHEMA_VER = 2;
   const GAS_KEYWORDS = ['氧气', '乙炔', '二氧化碳', '氩气', '氮气', '丙烷', '液化气', '混合气', '丁烷气', '丁烷'];
   const DOC_REGEX = /(?:CCHF|CK)\d{10,22}/gi;
+  // 兼容扫描件常见 OCR 误识（如 C->G/O, H->N, F->E/P, 0->O, 1->I/L）
+  const FUZZY_DOC_REGEX = /(?:[CGOQ0]{2}[HN][FEP]|C[KH])\s*[0-9OIL]{10,22}/gi;
   const CODE_REGEX = /\b0[356789]\d{8,9}\b/g;
+
+  function extractDocsFromText(rawText) {
+    const out = new Set();
+    const compact = String(rawText || '').replace(/[\r\n\t ]+/g, '');
+    (compact.match(DOC_REGEX) || []).forEach(m => out.add(m.toUpperCase()));
+    (String(rawText || '').match(FUZZY_DOC_REGEX) || []).forEach(m => {
+      const s = m.replace(/\s+/g, '').toUpperCase();
+      if (s.length >= 14 && /^[CGOQ0]{2}[HN][FEP]/.test(s)) {
+        const digits = s.slice(4).replace(/O/g, '0').replace(/[IL]/g, '1');
+        if (/^\d{10,22}$/.test(digits)) out.add('CCHF' + digits);
+      } else if (s.length >= 12 && /^CK/.test(s)) {
+        const digits = s.slice(2).replace(/O/g, '0').replace(/[IL]/g, '1');
+        if (/^\d{10,22}$/.test(digits)) out.add('CK' + digits);
+      }
+    });
+    return Array.from(out);
+  }
 
   let activeRoot = null;
   let ocrWorkers = null;
@@ -55,6 +75,7 @@
 
   function persistState() {
     WB.Store.save('mod_photo_check', {
+      schemaVer: SCHEMA_VER,
       tickets: state.tickets,
       availDates: state.availDates,
       targetDate: state.targetDate,
@@ -69,7 +90,8 @@
   async function hydrateState() {
     if (state.scanning || state._hydrated) return;
     const saved = await WB.Store.load('mod_photo_check');
-    if (saved && !state.scanning) {
+    // 自动丢弃旧版 v1 错误缓存（避免出现旧版合并成 1 张大卡片导致误报 0/0）
+    if (saved && saved.schemaVer === SCHEMA_VER && !state.scanning) {
       state.tickets = saved.tickets || [];
       state.availDates = saved.availDates || [];
       state.targetDate = saved.targetDate || '';
@@ -333,7 +355,7 @@
     const pool = [];
     for (let i = 0; i < 2; i++) {
       const w = await Tesseract.createWorker('eng');
-      await w.setParameters({ tessedit_char_whitelist: 'CCHFK0123456789' });
+      await w.setParameters({ tessedit_char_whitelist: 'CCHFKGOQIL0123456789' });
       pool.push(w);
     }
     ocrWorkers = pool;
@@ -367,8 +389,11 @@
 
       const updateStatus = (msg) => {
         const autoCnt = state.tickets.filter(t => t.matchType === 'auto').length;
-        state.scanLog = `⏳ ${msg} ｜ 平台已自动核销 ${autoCnt}/${state.tickets.length} 张`;
-        setGlobalBgPill(`⏳ 出库PDF ${donePages}/${totalPages || '?'}页 · 已核 ${autoCnt}单`, true, false);
+        const foundDocs = new Set(state.pdfPages.flatMap(p => p.docs || [])).size;
+        state.scanLog = state.tickets.length
+          ? `⏳ ${msg} ｜ 已检出 ${foundDocs} 个单号 · 平台自动核销 ${autoCnt}/${state.tickets.length} 张`
+          : `⏳ ${msg} ｜ 已检出 ${foundDocs} 个单号（请顺手导入「1. 出库清单」即可自动匹配）`;
+        setGlobalBgPill(`⏳ 出库PDF ${donePages}/${totalPages || '?'}页 · 检出${foundDocs}单`, true, false);
         const stEl = activeRoot && activeRoot.isConnected ? activeRoot.querySelector('#p-scan-log') : null;
         if (stEl) stEl.textContent = state.scanLog;
       };
@@ -389,17 +414,17 @@
           for (let p = 1; p <= item.pdf.numPages; p++) {
             globalPageSeq++;
             const page = await item.pdf.getPage(p);
-            // 渲染高清缩略预览图（scale 1.35 平衡清晰度与 50+ 页大 PDF 内存占用）
-            const vp = page.getViewport({ scale: 1.35 });
+            // 渲染清晰度 1.8x（保证单据号小字清晰可 OCR）
+            const vp = page.getViewport({ scale: 1.8 });
             const canvas = document.createElement('canvas');
             canvas.width = vp.width;
             canvas.height = vp.height;
             await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
 
             const textContent = await page.getTextContent();
             const textStr = textContent.items.map(it => it.str).join(' ');
-            const docs = Array.from(new Set((textStr.match(DOC_REGEX) || []).map(x => x.toUpperCase())));
+            const docs = extractDocsFromText(textStr);
             const codes = Array.from(new Set(textStr.match(CODE_REGEX) || []));
 
             const pageEntry = {
@@ -422,10 +447,9 @@
           }
         }
 
-        // 先刷新一次让左侧 PDF 预览立即可翻页
         refreshIfVisible();
 
-        // 对纯图片扫描页启用双核复用 OCR 自动检索单号 + 编码
+        // 对纯图片扫描页启用双核复用 OCR（优先高清晰裁剪单据头区抓单号，再扫全页抓物料编码）
         if (ocrQueue.length > 0 && window.Tesseract) {
           updateStatus(`开始双核 OCR 自动核对 ${ocrQueue.length} 页扫描单据...`);
           const pool = await getOcrWorkerPool();
@@ -435,13 +459,28 @@
             while (qIdx < ocrQueue.length) {
               const job = ocrQueue[qIdx++];
               ocrPages++;
-              const res = worker
-                ? await worker.recognize(job.canvas)
-                : await Tesseract.recognize(job.canvas, 'eng', { tessedit_char_whitelist: 'CCHFK0123456789' });
-              const rawTxt = (res.data.text || '');
-              const compact = rawTxt.replace(/\s+/g, '');
-              const docs = Array.from(new Set((compact.match(DOC_REGEX) || []).map(x => x.toUpperCase())));
-              const codes = Array.from(new Set(rawTxt.match(CODE_REGEX) || []));
+              const src = job.canvas;
+
+              // 1) 重点放大裁剪上半部表头区（单据号 OrderNum 所在区），大幅提高 CCHF 单号识别率
+              const topCanvas = document.createElement('canvas');
+              topCanvas.width = src.width;
+              topCanvas.height = Math.max(100, Math.round(src.height * 0.42));
+              topCanvas.getContext('2d').drawImage(src, 0, 0, topCanvas.width, topCanvas.height, 0, 0, topCanvas.width, topCanvas.height);
+
+              const rTop = worker
+                ? await worker.recognize(topCanvas)
+                : await Tesseract.recognize(topCanvas, 'eng');
+              let docs = extractDocsFromText(rTop.data.text || '');
+
+              // 2) 全页识别（提取全部 10/11 位物料编码 + 兜底补抓单号）
+              const rFull = worker
+                ? await worker.recognize(src)
+                : await Tesseract.recognize(src, 'eng');
+              const fullTxt = rFull.data.text || '';
+              const moreDocs = extractDocsFromText(fullTxt);
+              docs = Array.from(new Set([...docs, ...moreDocs]));
+              const codes = Array.from(new Set(fullTxt.match(CODE_REGEX) || []));
+
               job.pageEntry.docs = docs;
               job.pageEntry.codes = codes;
               donePages++;
@@ -460,13 +499,22 @@
         }
 
         runAutoMatchAgainstPages();
+        const foundDocs = new Set(state.pdfPages.flatMap(p => p.docs || [])).size;
+        const foundCodes = new Set(state.pdfPages.flatMap(p => p.codes || [])).size;
         const autoCnt = state.tickets.filter(t => t.matchType === 'auto').length;
         const remainCnt = state.tickets.filter(t => !t.checked).length;
-        state.scanLog = `✅ 平台自动核对完成：共 ${totalPages} 页 PDF（OCR ${ocrPages} 页）｜ 平台已核销 ${autoCnt} 张，仅剩 ${remainCnt} 张待你人工核对！`;
-        persistState();
-        setGlobalBgPill(`✅ 出库PDF核完 · 剩${remainCnt}单待人工`, true, true);
-        setTimeout(() => { if (!state.scanning) setGlobalBgPill('', false); }, 12000);
-        U.toast(`平台已自动核销 ${autoCnt} 张，仅剩 ${remainCnt} 张未检索到需人工复核！`, 'success');
+
+        if (!state.tickets.length) {
+          state.scanLog = `⚠️ 已扫完 ${totalPages} 页 PDF（检出 ${foundDocs} 个单号 / ${foundCodes} 个物料编码），但你尚未导入「1. 出库清单」，请拖入 Excel 即可瞬间完成自动核对！`;
+          setGlobalBgPill(`⚠️ PDF已扫完(${foundDocs}单) · 请导入清单`, true, true);
+          U.toast(`PDF 已扫完（检出 ${foundDocs} 个单号），请再导入「1. 出库清单」自动比对！`, 'warn');
+        } else {
+          state.scanLog = `✅ 平台自动核对完成：共 ${totalPages} 页 PDF（检出 ${foundDocs} 个单号 / ${foundCodes} 个编码）｜ 平台已核销 ${autoCnt}/${state.tickets.length} 张，剩余 ${remainCnt} 张待你人工核对！`;
+          persistState();
+          setGlobalBgPill(`✅ 出库PDF核完 · 已核${autoCnt}/剩${remainCnt}`, true, true);
+          setTimeout(() => { if (!state.scanning) setGlobalBgPill('', false); }, 12000);
+          U.toast(`平台已自动核销 ${autoCnt} 张，剩余 ${remainCnt} 张未检索到需人工复核！`, 'success');
+        }
       } catch (err) {
         state.scanLog = `❌ 出库 PDF 核对异常：${err.message}`;
         setGlobalBgPill('', false);
