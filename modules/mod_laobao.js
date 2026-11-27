@@ -139,7 +139,11 @@
   }
 
   function isChineseName(name) {
-    return /[\u4e00-\u9fa5]/.test(String(name || ''));
+    const s = String(name || '').trim();
+    if (!/[\u4e00-\u9fa5]/.test(s)) return false;
+    // 若以拉丁字母开头且含完整英文单词（如 "EDIKA WAMI艾迪" / "Carina马福佳"），判定为印方带中文绰号
+    if (/^[A-Za-z]{2,}/.test(s)) return false;
+    return true;
   }
 
   function extractPureChineseName(name) {
@@ -165,9 +169,7 @@
   function isEmployeeIdLike(val) {
     const s = normId(val);
     if (!s || s.length < 7 || s.length > 16) return false;
-    // 排除物资编码（0500.../0800.../1001P...）
     if (/^(?:0[1-9]\d{6,10}|1001P\d+|100P\d+)$/i.test(s)) return false;
-    // 常见工号形态：1~2位字母 + 6~13位数字（如 F07235024 / T0525000381 / F1212000305 / F032600317）
     if (/^[A-Z]{1,3}\d{6,13}$/.test(s)) return true;
     return false;
   }
@@ -197,6 +199,180 @@
     return R >= 170 && G <= 95 && B <= 95 && (R - G) >= 90 && (R - B) >= 90;
   }
 
+  /* ==================== 近似人员（模糊姓名）检索索引 ==================== */
+  const COMMON_ID_STOP_TOKENS = new Set(['BIN', 'BINTI', 'MUH', 'MOH', 'MUHAMMAD', 'MOHAMMAD', 'ABDUL', 'ANDI', 'SITI', 'PUTRA', 'PUTRI', 'AGUS', 'AHMAD', 'BUDI', 'DEDI', 'HADI', 'JOKO', 'RIKO', 'YUSUF']);
+  let _idIndexRef = null;
+  let _idUniqueList = [];
+  let _idTokenMap = new Map();
+
+  function extractLatinTokens(name) {
+    // 剥离中文字符与标点（如 "EDIKA WAMI艾迪" -> ["EDIKA", "WAMI"]，"AGUSTIAN ALDRIN C." -> ["AGUSTIAN", "ALDRIN"]）
+    const latin = String(name || '').replace(/[\u4e00-\u9fa5]+/g, ' ').toUpperCase().replace(/[^A-Z]+/g, ' ').trim();
+    if (!latin) return [];
+    return latin.split(/\s+/).filter(t => t.length >= 2);
+  }
+
+  function editDistance(a, b) {
+    if (a === b) return 0;
+    const m = a.length, n = b.length;
+    if (Math.abs(m - n) > 2) return 99;
+    let prev = new Array(n + 1);
+    let curr = new Array(n + 1);
+    for (let j = 0; j <= n; j++) prev[j] = j;
+    for (let i = 1; i <= m; i++) {
+      curr[0] = i;
+      let minRow = curr[0];
+      for (let j = 1; j <= n; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+        if (curr[j] < minRow) minRow = curr[j];
+      }
+      if (minRow > 2) return 99;
+      [prev, curr] = [curr, prev];
+    }
+    return prev[n];
+  }
+
+  function ensureIdFuzzyIndex() {
+    if (_idIndexRef === state.idByNik) return;
+    _idIndexRef = state.idByNik;
+    const seen = new Set();
+    const list = [];
+    const tMap = new Map();
+
+    Object.values(state.idByNik || {}).forEach(rec => {
+      if (!rec || !rec.nik || seen.has(rec.nik)) return;
+      seen.add(rec.nik);
+      const tokens = extractLatinTokens(rec.name);
+      const entry = { rec, tokens, flat: tokens.join(' ') };
+      const idx = list.length;
+      list.push(entry);
+      tokens.forEach(t => {
+        if (t.length < 3) return;
+        if (!tMap.has(t)) tMap.set(t, []);
+        tMap.get(t).push(idx);
+      });
+    });
+    _idUniqueList = list;
+    _idTokenMap = tMap;
+  }
+
+  /** 在印方花名册中查找近似姓名（支持简称如 WAMI -> EDIKA WAMI、中印混写如 EDIKA WAMI艾迪、拼写小错如 RIFLDO -> RIFALDO） */
+  function findFuzzyIdMatches(name, idRaw) {
+    ensureIdFuzzyIndex();
+    if (!_idUniqueList.length) return [];
+    const qTokens = extractLatinTokens(name).filter(t => t.length >= 3);
+    if (!qTokens.length) return [];
+    const qFlat = qTokens.join(' ');
+
+    // 1. 优先用倒排索引收集候选（极快）；若倒排无命中且仅 1~3 词，兜底全表做编辑距离检索
+    const candIdxSet = new Set();
+    qTokens.forEach(t => {
+      const arr = _idTokenMap.get(t);
+      if (arr) arr.forEach(i => candIdxSet.add(i));
+    });
+
+    const pool = candIdxSet.size > 0
+      ? Array.from(candIdxSet).map(i => _idUniqueList[i])
+      : _idUniqueList;
+
+    const scored = [];
+    for (const entry of pool) {
+      if (!entry.tokens.length) continue;
+      let score = 0;
+
+      if (entry.flat === qFlat) {
+        score = 100;
+      } else {
+        let exactHits = 0;
+        let fuzzyHits = 0;
+        let rareHit = false;
+
+        for (const qt of qTokens) {
+          if (entry.tokens.includes(qt)) {
+            exactHits++;
+            if (!COMMON_ID_STOP_TOKENS.has(qt) && qt.length >= 4) rareHit = true;
+          } else {
+            // 允许单字拼写误差（如 RIFLDO vs RIFALDO）或前缀/后缀包含（长度>=4）
+            const maxDist = qt.length >= 6 ? 2 : (qt.length >= 4 ? 1 : 0);
+            const matchedFuzzy = entry.tokens.some(ct =>
+              (ct.length >= 4 && qt.length >= 4 && (ct.includes(qt) || qt.includes(ct))) ||
+              (maxDist > 0 && editDistance(qt, ct) <= maxDist)
+            );
+            if (matchedFuzzy) fuzzyHits++;
+          }
+        }
+
+        const totalMatched = exactHits + fuzzyHits;
+        if (qTokens.length === 1) {
+          // 单词简称（如只写 "WAMI" 匹配 "EDIKA WAMI"）：精确命中非高频通用词即可判为近似
+          const qt = qTokens[0];
+          if (exactHits === 1 && (!COMMON_ID_STOP_TOKENS.has(qt) || entry.tokens.length <= 2)) {
+            score = 88;
+          } else if (fuzzyHits === 1 && qt.length >= 5) {
+            score = 72;
+          }
+        } else {
+          // 多词姓名：至少命中 2 词，或命中 1 个高区分度词且覆盖率 >= 50%
+          if (exactHits === qTokens.length) score = 95;
+          else if (totalMatched >= 2) score = 78 + exactHits * 5 + fuzzyHits * 2;
+          else if (exactHits === 1 && rareHit && qTokens.length === 2) score = 70;
+        }
+      }
+
+      if (score >= 70) {
+        // 若工号也很接近（仅错 1~2 位或前 5 位一致），额外加分置顶
+        if (idRaw && entry.rec.nik) {
+          if (editDistance(idRaw, entry.rec.nik) <= 2) score += 15;
+          else if (idRaw.slice(0, 5) === entry.rec.nik.slice(0, 5)) score += 8;
+        }
+        scored.push({ rec: entry.rec, score });
+      }
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, 3).map(x => x.rec);
+  }
+
+  /** 在中方花名册中查找近似姓名（支持去拼音、包含关系、3字姓名错1字） */
+  function findFuzzyCnMatches(name, idRaw) {
+    const pureCn = extractPureChineseName(name);
+    if (!pureCn || pureCn.length < 2) return [];
+    const exact = state.cnByName[name] || state.cnByName[pureCn];
+    if (exact && exact.length) return exact.slice(0, 3);
+
+    const scored = [];
+    Object.entries(state.cnByName || {}).forEach(([cnName, recs]) => {
+      const cPure = extractPureChineseName(cnName);
+      if (!cPure || cPure.length < 2) return;
+      let score = 0;
+      if (cPure.includes(pureCn) || pureCn.includes(cPure)) {
+        score = 88;
+      } else if (cPure.length === pureCn.length && pureCn.length >= 3) {
+        let same = 0;
+        for (let i = 0; i < pureCn.length; i++) if (cPure[i] === pureCn[i]) same++;
+        if (same >= pureCn.length - 1) score = 78;
+      }
+      if (score > 0 && recs && recs[0]) {
+        if (idRaw && recs[0].id) {
+          if (editDistance(idRaw, recs[0].id) <= 2) score += 15;
+          else if (idRaw.slice(0, 5) === recs[0].id.slice(0, 5)) score += 8;
+        }
+        scored.push({ rec: recs[0], score });
+      }
+    });
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, 3).map(x => x.rec);
+  }
+
+  function formatCandidateList(cands) {
+    return cands.map(c => {
+      const code = c.nik || c.id || '无ID';
+      const st = c.leftDate ? `离职:${c.leftDate}` : (c.status || '在职');
+      return `${c.name}[${code}|${c.company}|${st}]`;
+    }).join('；');
+  }
+
   /* ==================== 中/印双花名册核对 ==================== */
   function auditSinglePerson(p, fileName, expectedCompany) {
     const hasCnRoster = Object.keys(state.cnById).length > 0 || Object.keys(state.cnByName).length > 0;
@@ -207,8 +383,14 @@
     let issueType = '';
     let issueDesc = '';
     if (!idRaw) {
-      issueType = '缺失ID卡号';
-      issueDesc = rem || '未填写ID卡号/工号';
+      const fuzzy = isCn ? findFuzzyCnMatches(name, '') : findFuzzyIdMatches(name, '');
+      if (fuzzy.length) {
+        issueType = '近似人员(缺ID)';
+        issueDesc = `未填ID，疑似花名册：${formatCandidateList(fuzzy)}`;
+      } else {
+        issueType = '缺失ID卡号';
+        issueDesc = rem || '未填写ID卡号/工号';
+      }
     } else if (isCn) {
       if (hasCnRoster) {
         const hit = state.cnById[idRaw];
@@ -243,8 +425,16 @@
                 issueDesc = `花名册同名人员ID为 ${first.id || '空'}（${first.dept}/${first.workshop}）`;
               }
             } else {
-              issueType = '中方名单查无此人';
-              issueDesc = '在中方人员ID卡信息表中未查到该ID与姓名';
+              const fuzzyCn = findFuzzyCnMatches(name, idRaw);
+              const fuzzyId = !fuzzyCn.length && hasIdRoster ? findFuzzyIdMatches(name, idRaw) : [];
+              const fuzzy = fuzzyCn.length ? fuzzyCn : fuzzyId;
+              if (fuzzy.length) {
+                issueType = '近似人员';
+                issueDesc = `ID未匹配，疑似花名册：${formatCandidateList(fuzzy)}`;
+              } else {
+                issueType = '中方名单查无此人';
+                issueDesc = '在中方人员ID卡信息表中未查到该ID与近似姓名';
+              }
             }
           }
         }
@@ -261,8 +451,14 @@
             issueDesc = `印方花名册状态为 ${hit.status}`;
           }
         } else {
-          issueType = '印方名单查无此ID';
-          issueDesc = '在 MP HJF / MP OST 中均未匹配到该 NIK（可能离职/工号错误）';
+          const fuzzy = findFuzzyIdMatches(name, idRaw);
+          if (fuzzy.length) {
+            issueType = '近似人员';
+            issueDesc = `NIK未匹配，疑似花名册：${formatCandidateList(fuzzy)}`;
+          } else {
+            issueType = '印方名单查无此ID';
+            issueDesc = '在 MP HJF / MP OST 中均未匹配到该 NIK 或近似姓名（可能离职/工号错误）';
+          }
         }
       }
     }
