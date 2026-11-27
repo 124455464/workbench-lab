@@ -162,6 +162,19 @@
     rebuildDailyOutput();
   }
 
+  function isMaterialCodeLike(s) {
+    const c = U.formatCode(s);
+    if (!c) return false;
+    if (state.stockMap.has(c)) return true;
+    return /^(?:1001P\d+|100P\d+|0[1-9]\d{5,10}|[A-Z]\d{5,}|9\d{5,})$/i.test(c);
+  }
+
+  function isWarehouseLike(s) {
+    const t = U.cleanStr(s);
+    if (!t || isMaterialCodeLike(t)) return false;
+    return /^(?:综合仓?|工程物资仓?|通用仓?|配件仓?|辅料仓?|五金仓?|电厂仓?|设备仓?|化工仓?|劳保仓?|气瓶间?|物资仓|OST|P\d.*)$/i.test(t) || /仓$/.test(t);
+  }
+
   async function loadDailyFile(file) {
     const parsed = await U.readSpreadsheet(file);
     const sheets = {};
@@ -182,18 +195,44 @@
       let lastNonEmptyCol = rawH.length - 1;
       while (lastNonEmptyCol >= 0 && !rawH[lastNonEmptyCol]) lastNonEmptyCol--;
       const headers = rawH.slice(0, lastNonEmptyCol + 1);
-      const rows = aoa.slice(hdrIdx + 1)
-        .filter(r => r.some(v => U.cleanStr(v) !== ''))
-        .map(r => r.slice(0, headers.length));
 
       const iDate = headers.findIndex(h => h.includes('日期'));
+      const iPerson = headers.findIndex(h => /领料人|领用人|申请人|姓名/.test(h));
       const dates = new Set();
-      if (iDate >= 0) {
-        rows.forEach(r => {
-          const d = U.formatDate(r[iDate]);
-          if (/^\d{4}-\d{2}-\d{2}$/.test(d)) dates.add(d);
-        });
+      const rows = [];
+
+      // 逐行扫描并自动向下继承同一批次省略的「申报日期」与「领料人」（遇完全空行即断开）
+      let lastDate = '';
+      let lastPerson = '';
+      for (let i = hdrIdx + 1; i < aoa.length; i++) {
+        const sliced = aoa[i].slice(0, headers.length).map(v => U.cleanStr(v));
+        if (sliced.every(v => v === '')) {
+          lastDate = '';
+          lastPerson = '';
+          continue;
+        }
+        // 过滤明显非物料的纯备注/汇总行（如整行只有尾部1个非业务单元格）
+        const nonEmptyCount = sliced.filter(v => v !== '').length;
+        if (nonEmptyCount <= 1 && iDate >= 0 && !sliced[iDate]) continue;
+
+        if (iDate >= 0) {
+          const d = U.formatDate(sliced[iDate]);
+          if (/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+            sliced[iDate] = d;
+            lastDate = d;
+            lastPerson = iPerson >= 0 ? sliced[iPerson] : '';
+            dates.add(d);
+          } else if (!sliced[iDate] && lastDate) {
+            sliced[iDate] = lastDate;
+            if (iPerson >= 0 && !sliced[iPerson] && lastPerson) {
+              sliced[iPerson] = lastPerson;
+            }
+          }
+        }
+        rows.push(sliced);
       }
+
+      if (!rows.length) return;
       validNames.push(sn);
       sheets[sn] = { headers, rows, availDates: Array.from(dates).sort().reverse() };
     });
@@ -227,7 +266,12 @@
     });
 
     const iDate = baseH.findIndex(h => h.includes('日期'));
+    const iPerson = baseH.findIndex(h => /领料人|领用人|申请人|姓名/.test(h));
     const iCode = baseH.findIndex(h => h.includes('编码') && !h.includes('货位') && !h.includes('用途'));
+    const iName = baseH.findIndex(h => /存货名|物料名|物资名|名称/.test(h) && !/仓库|货位/.test(h));
+    const iSpec = baseH.findIndex(h => /规格|型号/.test(h));
+    const iUnit = baseH.findIndex(h => /单位/.test(h));
+    const iQty = baseH.findIndex(h => /数量/.test(h));
     const iWh = baseH.findIndex(h => h.includes('仓库'));
     const iLoc = baseH.indexOf('货位编码');
     const iLocName = baseH.indexOf('货位名称');
@@ -236,18 +280,45 @@
     const target = state.dailyTargetDate.trim();
     const out = [];
 
+    // 兼容历史缓存未提前继承日期的旧数据：重建时再做一次同批日期/领料人向下兜底
+    let runDate = '';
+    let runPerson = '';
     for (const rawRow of state.dailyRawRows) {
-      if (target && iDate >= 0) {
-        const d = U.formatDate(rawRow[iDate]);
-        if (!d.includes(target)) continue;
-      }
       const row = baseH.map((_, idx) => (idx < rawRow.length ? U.cleanStr(rawRow[idx]) : ''));
-      if (iDate >= 0 && row[iDate]) {
+      if (iDate >= 0) {
         const normD = U.formatDate(row[iDate]);
-        if (/^\d{4}-\d{2}-\d{2}$/.test(normD)) row[iDate] = normD;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(normD)) {
+          row[iDate] = normD;
+          runDate = normD;
+          runPerson = iPerson >= 0 ? row[iPerson] : '';
+        } else if (!row[iDate] && runDate) {
+          row[iDate] = runDate;
+          if (iPerson >= 0 && !row[iPerson] && runPerson) row[iPerson] = runPerson;
+        }
+        if (target && !(row[iDate] || '').includes(target)) continue;
       }
 
-      // 智能提取存货编码：优先取编码列；若个别行串列（如把“综合仓”填进编码列、真编码挤到下一列），自动横向兜底检索真实编码
+      // 智能识别并自动回正「仓库插队进编码列导致编码/名称/规格/单位/数量整体右移 1 列」的错列行
+      if (iCode >= 0 && iCode + 5 < rawRow.length) {
+        const cellAtCode = row[iCode];
+        const cellNext = row[iCode + 1];
+        if (isWarehouseLike(cellAtCode) && isMaterialCodeLike(cellNext)) {
+          const whVal = cellAtCode;
+          const codeVal = U.formatCode(cellNext);
+          const nameVal = row[iCode + 2] || '';
+          const specVal = row[iCode + 3] || '';
+          const unitVal = row[iCode + 4] || '';
+          const qtyVal = row[iCode + 5] || '';
+          row[iCode] = codeVal;
+          if (iName >= 0) row[iName] = nameVal;
+          if (iSpec >= 0) row[iSpec] = specVal;
+          if (iUnit >= 0) row[iUnit] = unitVal;
+          if (iQty >= 0) row[iQty] = qtyVal;
+          if (iWh >= 0) row[iWh] = whVal;
+        }
+      }
+
+      // 提取存货编码（含兜底横向扫描）
       let lookupCode = '';
       if (iCode >= 0) {
         const c0 = U.formatCode(row[iCode]);
@@ -255,10 +326,9 @@
           row[iCode] = c0;
           lookupCode = c0;
         } else {
-          // 扫描同行相邻列，精准找回串列编码（如 1001P21484426 或 050107020）
           for (let k = 0; k < rawRow.length; k++) {
             const cand = U.formatCode(rawRow[k]);
-            if (cand && /^(?:1001P\d+|0[1-9]\d{6,10})$/i.test(cand) && state.stockMap.has(cand)) {
+            if (cand && /^(?:1001P\d+|100P\d+|0[1-9]\d{5,10})$/i.test(cand) && state.stockMap.has(cand)) {
               lookupCode = cand;
               break;
             }
@@ -268,10 +338,12 @@
       }
 
       // 从现存量补全全部有效货位（优先取正库存货位，严格分离「货位编码」与「货位名称」）
+      let stockWhHint = '';
       if (lookupCode && state.stockMap.has(lookupCode)) {
         const allHits = state.stockMap.get(lookupCode) || [];
         const posHits = allHits.filter(h => h.qty > 0);
         const hits = posHits.length ? posHits : allHits;
+        stockWhHint = hits.map(h => U.cleanStr(h.wh)).filter(Boolean).join(' ');
 
         const seenPairs = new Set();
         const locCodes = [];
@@ -289,19 +361,20 @@
         if (!row[iLoc] && locCodes.length) row[iLoc] = locCodes.join(' / ');
         if (!row[iLocName] && locNames.length) row[iLocName] = locNames.join(' / ');
       }
-      out.push(row);
+      out.push({ row, stockWhHint });
     }
 
-    // 综合仓置顶 (0) -> 其他仓居中 (1) -> P3/P7/P9/110105/110110 沉底 (2)
-    function getBucket(row) {
-      const whTxt = iWh >= 0 ? (row[iWh] || '') : '';
+    // 综合仓置顶 (0) -> 其他仓居中 (1) -> P3/P7/P9/110105/110110/2105 沉底 (2)
+    function getBucket(item) {
+      const row = item.row;
+      const whTxt = `${iWh >= 0 ? (row[iWh] || '') : ''} ${item.stockWhHint || ''}`;
       const locTxt = `${row[iLoc] || ''} ${row[iLocName] || ''} ${iAltLoc >= 0 ? row[iAltLoc] : ''} ${whTxt}`.toUpperCase();
-      if (/P3|P7|P9|110105|110110/.test(locTxt)) return 2;
+      if (/P3|P7|P9|110105|110110|2105/.test(locTxt)) return 2;
       if (whTxt.includes('综合仓')) return 0;
       return 1;
     }
 
-    const indexed = out.map((r, idx) => ({ r, idx, b: getBucket(r) }));
+    const indexed = out.map((item, idx) => ({ r: item.row, idx, b: getBucket(item) }));
     indexed.sort((a, b) => (a.b - b.b) || (a.idx - b.idx));
 
     state.dailyFilteredHeaders = baseH;
@@ -572,12 +645,13 @@
       };
       if (state.dailyFilteredHeaders.length) {
         const iLoc = state.dailyFilteredHeaders.indexOf('货位编码');
+        const iLocName = state.dailyFilteredHeaders.indexOf('货位名称');
         U.renderPagedTable(root.querySelector('#o-daily-table'), {
           headers: state.dailyFilteredHeaders,
           rows: state.dailyFilteredRows,
           page: state.dailyPage,
           pageSize: 100,
-          rowClassFn: r => (/P3|P7|P9|110105|110110/i.test(r[iLoc] || '') ? 'row-warn' : ''),
+          rowClassFn: r => (/P3|P7|P9|110105|110110|2105/i.test(`${r[iLoc] || ''} ${r[iLocName] || ''}`) ? 'row-warn' : ''),
           onPageChange: pg => { state.dailyPage = pg; renderModule(root); }
         });
       } else {
