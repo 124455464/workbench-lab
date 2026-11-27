@@ -121,6 +121,8 @@
       const iWh = findExactOrMatch(h, ['仓库名称', '仓库'], ['仓库'], /编码|代码/);
       const iLoc = findExactOrMatch(h, ['货位编码', '库位编码', '货位代码'], ['货位编码', '库位编码', '货位'], /名称/);
       const iLocName = findExactOrMatch(h, ['货位名称', '库位名称'], ['货位名', '库位名'], /编码|代码/);
+      const iCatCode = findExactOrMatch(h, ['存货分类编码', '物料分类编码', '分类编码'], ['分类编码', '大类编码']);
+      const iCatName = findExactOrMatch(h, ['存货分类名称', '物料分类名称', '分类名称'], ['分类名', '大类名']);
       const iQty = findExactOrMatch(h, ['现存数量', '现存量', '可用数量', '结存主数量', '结存数量'], ['现存', '可用', '结存']);
 
       for (let i = hdrIdx + 1; i < aoa.length; i++) {
@@ -135,6 +137,8 @@
           wh: iWh >= 0 ? U.cleanStr(r[iWh]) : sn,
           loc: iLoc >= 0 ? U.cleanStr(r[iLoc]) : '',
           locName: iLocName >= 0 ? U.cleanStr(r[iLocName]) : '',
+          catCode: iCatCode >= 0 ? U.cleanStr(r[iCatCode]) : '',
+          catName: iCatName >= 0 ? U.cleanStr(r[iCatName]) : '',
           qty: iQty >= 0 ? U.parseNum(r[iQty]) : 0
         };
         if (!map.has(code)) map.set(code, []);
@@ -279,33 +283,57 @@
     U.toast(`OST 申报表载入成功：表 [${defaultSn}]${dateTip}${volTip}`, 'success');
   }
 
-  function rebuildDailyOutput() {
-    const baseH = [...state.dailyRawHeaders];
-    const appendCols = ['子项号', '用途编码', '货位编码', '货位名称'];
-    appendCols.forEach(c => {
-      if (!baseH.includes(c)) baseH.push(c);
-    });
+  const DAILY_STD_HEADERS = [
+    '日期', '领料人', '仓库类型', '物资编码', '存货名称', '规格型号',
+    '计量单位', '领用数量', '备注：', '货位编码', '货位名称', '项目大类', '使用位置'
+  ];
 
-    const iDate = baseH.findIndex(h => h.includes('日期'));
-    const iPerson = baseH.findIndex(h => /领料人|领用人|申请人|姓名/.test(h));
-    const iCode = baseH.findIndex(h => h.includes('编码') && !h.includes('货位') && !h.includes('用途'));
-    const iName = baseH.findIndex(h => /存货名|物料名|物资名|名称/.test(h) && !/仓库|货位/.test(h));
-    const iSpec = baseH.findIndex(h => /规格|型号/.test(h));
-    const iUnit = baseH.findIndex(h => /单位/.test(h));
-    const iQty = baseH.findIndex(h => /数量/.test(h));
-    const iWh = baseH.findIndex(h => h.includes('仓库'));
-    const iLoc = baseH.indexOf('货位编码');
-    const iLocName = baseH.indexOf('货位名称');
-    const iAltLoc = baseH.findIndex((h, idx) => idx !== iLoc && idx !== iLocName && h.includes('货位'));
+  /** 自动判定使用位置编码：办公用品 -> SC015 | 劳保用品 -> SC013 | 其他物资 -> SC016 */
+  function classifyUsagePos(code, name, stockHits) {
+    const c = U.formatCode(code);
+    const n = U.cleanStr(name);
+    const catCodes = (stockHits || []).map(h => U.cleanStr(h.catCode)).filter(Boolean);
+    const catNames = (stockHits || []).map(h => U.cleanStr(h.catName)).filter(Boolean).join(' ');
+
+    // 1. 优先按 ERP 现存量存货分类与编码前缀精准判定（0803 劳保用品 / 0804 办公用具）
+    if (c.startsWith('0803') || catCodes.some(k => k.startsWith('0803')) || /劳保|防护用品|worker\s*protective/i.test(catNames)) {
+      return 'SC013';
+    }
+    if (c.startsWith('0804') || catCodes.some(k => k.startsWith('0804')) || /办公|office\s*appliances/i.test(catNames)) {
+      return 'SC015';
+    }
+    // 2. 若已在现存量命中明确其他大类（如 1001P204 / 0806 / 0501），直接归为其他物资 SC016（如油漆记号笔 1001P20401437 -> SC016）
+    if (catCodes.length > 0 || /^(?:1001P|100P|05|06|07|0806)/i.test(c)) {
+      // 仅对明确劳保品名（如跨大类劳保手套/安全帽/防尘面具）做兜底
+      if (/劳保|防尘面具|防毒面具|安全帽|劳保鞋|安全鞋|焊工手套|电工手套|防尘口罩|过滤棉/.test(n)) return 'SC013';
+      return 'SC016';
+    }
+    // 3. 未入库编码按品名关键词兜底
+    if (/劳保|防尘面具|防毒面具|口罩|手套|安全帽|安全鞋|护目镜|耳塞|耳罩|安全带|防护服|过滤棉/.test(n)) return 'SC013';
+    if (/打印纸|A4|中性笔|圆珠笔|白板笔|订书|笔记本|文件夹|档案盒|计算器|回形针|墨水|硒鼓|碳粉|便利贴|纸巾|抽纸/.test(n)) return 'SC015';
+    return 'SC016';
+  }
+
+  function rebuildDailyOutput() {
+    const rawH = [...state.dailyRawHeaders];
+    const iDate = rawH.findIndex(h => h.includes('日期'));
+    const iPerson = rawH.findIndex(h => /领料人|领用人|申请人|姓名/.test(h));
+    const iCode = rawH.findIndex(h => h.includes('编码') && !h.includes('货位') && !h.includes('用途'));
+    const iName = rawH.findIndex(h => /存货名|物料名|物资名|名称/.test(h) && !/仓库|货位/.test(h));
+    const iSpec = rawH.findIndex(h => /规格|型号/.test(h));
+    const iUnit = rawH.findIndex(h => /单位/.test(h));
+    const iQty = rawH.findIndex(h => /数量/.test(h));
+    const iWh = rawH.findIndex(h => h.includes('仓库'));
+    const iRem = rawH.findIndex(h => /备注|用途|说明/.test(h));
+    const iRawLoc = rawH.findIndex(h => h.includes('货位') && !h.includes('名称'));
 
     const target = state.dailyTargetDate.trim();
     const out = [];
 
-    // 兼容历史缓存未提前继承日期的旧数据：重建时再做一次同批日期/领料人向下兜底
     let runDate = '';
     let runPerson = '';
     for (const rawRow of state.dailyRawRows) {
-      const row = baseH.map((_, idx) => (idx < rawRow.length ? U.cleanStr(rawRow[idx]) : ''));
+      const row = rawH.map((_, idx) => (idx < rawRow.length ? U.cleanStr(rawRow[idx]) : ''));
       if (iDate >= 0) {
         const normD = U.formatDate(row[iDate]);
         if (/^\d{4}-\d{2}-\d{2}$/.test(normD)) {
@@ -319,7 +347,7 @@
         if (target && !(row[iDate] || '').includes(target)) continue;
       }
 
-      // 智能识别并自动回正「仓库插队进编码列导致编码/名称/规格/单位/数量整体右移 1 列」的错列行
+      // 自动回正「仓库插队进编码列导致编码/名称/规格/单位/数量整体右移 1 列」的错列行
       if (iCode >= 0 && iCode + 5 < rawRow.length) {
         const cellAtCode = row[iCode];
         const cellNext = row[iCode + 1];
@@ -360,16 +388,19 @@
 
       // 从现存量补全全部有效货位（优先取正库存货位，严格分离「货位编码」与「货位名称」）
       let stockWhHint = '';
+      let locCodeStr = iRawLoc >= 0 ? (row[iRawLoc] || '') : '';
+      let locNameStr = '';
+      let stockHits = [];
       if (lookupCode && state.stockMap.has(lookupCode)) {
         const allHits = state.stockMap.get(lookupCode) || [];
         const posHits = allHits.filter(h => h.qty > 0);
-        const hits = posHits.length ? posHits : allHits;
-        stockWhHint = hits.map(h => U.cleanStr(h.wh)).filter(Boolean).join(' ');
+        stockHits = posHits.length ? posHits : allHits;
+        stockWhHint = stockHits.map(h => U.cleanStr(h.wh)).filter(Boolean).join(' ');
 
         const seenPairs = new Set();
         const locCodes = [];
         const locNames = [];
-        hits.forEach(h => {
+        stockHits.forEach(h => {
           const lc = U.cleanStr(h.loc);
           const ln = U.cleanStr(h.locName);
           if (!lc && !ln) return;
@@ -379,17 +410,35 @@
           if (lc) locCodes.push(lc);
           if (ln) locNames.push(ln);
         });
-        if (!row[iLoc] && locCodes.length) row[iLoc] = locCodes.join(' / ');
-        if (!row[iLocName] && locNames.length) row[iLocName] = locNames.join(' / ');
+        if (locCodes.length) locCodeStr = locCodes.join(' / ');
+        if (locNames.length) locNameStr = locNames.join(' / ');
       }
-      out.push({ row, stockWhHint });
+
+      const dateVal = iDate >= 0 ? (row[iDate] || '') : '';
+      const personVal = iPerson >= 0 ? (row[iPerson] || '') : '';
+      let whVal = iWh >= 0 ? (row[iWh] || '') : '';
+      if (!whVal && stockHits.length && stockHits[0].wh) whVal = stockHits[0].wh;
+      const codeVal = lookupCode || (iCode >= 0 ? U.formatCode(row[iCode]) : '');
+      const nameVal = iName >= 0 ? (row[iName] || '') : '';
+      const specVal = iSpec >= 0 ? (row[iSpec] || '') : '';
+      const unitVal = iUnit >= 0 ? (row[iUnit] || '') : '';
+      const qtyVal = iQty >= 0 ? (row[iQty] || '') : '';
+      const remVal = iRem >= 0 ? (row[iRem] || '') : '';
+      const projCat = '00';
+      const usagePos = classifyUsagePos(codeVal, nameVal, stockHits);
+
+      const stdRow = [
+        dateVal, personVal, whVal, codeVal, nameVal, specVal,
+        unitVal, qtyVal, remVal, locCodeStr, locNameStr, projCat, usagePos
+      ];
+      out.push({ row: stdRow, stockWhHint });
     }
 
     // 综合仓置顶 (0) -> 其他仓居中 (1) -> P3/P7/P9/110105/110110/2105 沉底 (2)
     function getBucket(item) {
       const row = item.row;
-      const whTxt = `${iWh >= 0 ? (row[iWh] || '') : ''} ${item.stockWhHint || ''}`;
-      const locTxt = `${row[iLoc] || ''} ${row[iLocName] || ''} ${iAltLoc >= 0 ? row[iAltLoc] : ''} ${whTxt}`.toUpperCase();
+      const whTxt = `${row[2] || ''} ${item.stockWhHint || ''}`;
+      const locTxt = `${row[9] || ''} ${row[10] || ''} ${whTxt}`.toUpperCase();
       if (/P3|P7|P9|110105|110110|2105/.test(locTxt)) return 2;
       if (whTxt.includes('综合仓')) return 0;
       return 1;
@@ -398,7 +447,7 @@
     const indexed = out.map((item, idx) => ({ r: item.row, idx, b: getBucket(item) }));
     indexed.sort((a, b) => (a.b - b.b) || (a.idx - b.idx));
 
-    state.dailyFilteredHeaders = baseH;
+    state.dailyFilteredHeaders = DAILY_STD_HEADERS;
     state.dailyFilteredRows = indexed.map(x => x.r);
   }
 
@@ -564,7 +613,7 @@
       ${state.subTab === 'daily' ? `
         <div class="panel">
           <div class="panel-title">
-            <span>📅 OST 每日物资筛选输出（自然日切片 · 追加子项号/用途编码/货位编码 · 综合仓置顶 / P3·P7·P9 沉底）</span>
+            <span>📅 OST 每日物资筛选输出（标准 13 列：货位编码/名称 · 项目大类 00 · 使用位置 SC015/SC016/SC013 · 综合仓置顶 / P系沉底）</span>
             <span class="pill pill-blue">${state.dailyFileName || '待导入 OST 领料申报表'}</span>
           </div>
           <div class="toolbar">
@@ -653,14 +702,15 @@
         U.toast(`已复制 ${state.dailyFilteredRows.length} 行 OST 每日筛选数据`, 'success');
       };
       root.querySelector('#o-daily-exp').onclick = () => {
-        const iCode = state.dailyFilteredHeaders.findIndex(h => h.includes('编码') && !h.includes('货位') && !h.includes('用途'));
+        const iCode = state.dailyFilteredHeaders.indexOf('物资编码');
         const iLoc = state.dailyFilteredHeaders.indexOf('货位编码');
+        const iProjCat = state.dailyFilteredHeaders.indexOf('项目大类');
         const tag = state.dailyTargetDate || '全量';
         U.exportWorkbook([{
           name: 'OST每日物资输出',
           headers: state.dailyFilteredHeaders,
           rows: state.dailyFilteredRows,
-          textCols: [iCode, iLoc].filter(i => i >= 0)
+          textCols: [iCode, iLoc, iProjCat].filter(i => i >= 0)
         }], `OST每日物资输出_${tag}.xlsx`);
         U.toast(`已导出 OST每日物资输出_${tag}.xlsx`, 'success');
       };
