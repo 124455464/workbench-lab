@@ -347,7 +347,7 @@
         const ws = wb.Sheets[name];
         sheets[name] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false });
       });
-      return { sheetNames: wb.SheetNames, sheets, fileName: file.name };
+      return { sheetNames: wb.SheetNames, sheets, fileName: file.name, wb };
     },
 
     exportWorkbook(sheetConfigs, fileName) {

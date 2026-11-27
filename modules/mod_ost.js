@@ -202,6 +202,10 @@
       const rows = [];
 
       // 逐行扫描并自动向下继承同一批次省略的「申报日期」与「领料人」（遇完全空行即断开）
+      // 同时自动屏蔽历史行中误填的 =TODAY() / =NOW() 动态公式日期（防止旧记录每天跟着变当天日期混入筛选）
+      const rawWs = parsed.wb && parsed.wb.Sheets ? parsed.wb.Sheets[sn] : null;
+      const wsRange = rawWs && rawWs['!ref'] ? XLSX.utils.decode_range(rawWs['!ref']) : { s: { r: 0, c: 0 } };
+      let volatileSkipped = 0;
       let lastDate = '';
       let lastPerson = '';
       for (let i = hdrIdx + 1; i < aoa.length; i++) {
@@ -216,16 +220,31 @@
         if (nonEmptyCount <= 1 && iDate >= 0 && !sliced[iDate]) continue;
 
         if (iDate >= 0) {
-          const d = U.formatDate(sliced[iDate]);
-          if (/^\d{4}-\d{2}-\d{2}$/.test(d)) {
-            sliced[iDate] = d;
-            lastDate = d;
-            lastPerson = iPerson >= 0 ? sliced[iPerson] : '';
-            dates.add(d);
-          } else if (!sliced[iDate] && lastDate) {
-            sliced[iDate] = lastDate;
-            if (iPerson >= 0 && !sliced[iPerson] && lastPerson) {
-              sliced[iPerson] = lastPerson;
+          let isVolatileDate = false;
+          if (rawWs && typeof XLSX !== 'undefined' && XLSX.utils && XLSX.utils.encode_cell) {
+            const cellAddr = XLSX.utils.encode_cell({ r: wsRange.s.r + i, c: wsRange.s.c + iDate });
+            const rawCell = rawWs[cellAddr];
+            if (rawCell && rawCell.f && /\b(?:TODAY|NOW)\s*\(/i.test(String(rawCell.f))) {
+              isVolatileDate = true;
+              volatileSkipped++;
+            }
+          }
+
+          if (isVolatileDate) {
+            // 误写 =TODAY() 的历史行改归入其上一行真实日期（若无则清空日期），不再污染当天筛选
+            sliced[iDate] = lastDate || '';
+          } else {
+            const d = U.formatDate(sliced[iDate]);
+            if (/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+              sliced[iDate] = d;
+              lastDate = d;
+              lastPerson = iPerson >= 0 ? sliced[iPerson] : '';
+              dates.add(d);
+            } else if (!sliced[iDate] && lastDate) {
+              sliced[iDate] = lastDate;
+              if (iPerson >= 0 && !sliced[iPerson] && lastPerson) {
+                sliced[iPerson] = lastPerson;
+              }
             }
           }
         }
@@ -234,7 +253,7 @@
 
       if (!rows.length) return;
       validNames.push(sn);
-      sheets[sn] = { headers, rows, availDates: Array.from(dates).sort().reverse() };
+      sheets[sn] = { headers, rows, availDates: Array.from(dates).sort().reverse(), volatileSkipped };
     });
 
     if (!validNames.length) throw new Error('OST 申报表无有效数据工作表');
@@ -255,7 +274,9 @@
     activateDailySheet(defaultSn);
     persistState();
     const dateTip = state.dailyTargetDate ? `，已自动筛选最新日期 ${state.dailyTargetDate}（${state.dailyFilteredRows.length} 行）` : `（${state.dailyRawRows.length} 行）`;
-    U.toast(`OST 申报表载入成功：表 [${defaultSn}]${dateTip}`, 'success');
+    const volCnt = (sheets[defaultSn] && sheets[defaultSn].volatileSkipped) || 0;
+    const volTip = volCnt > 0 ? `；已自动排除 ${volCnt} 行含 =TODAY() 公式的历史旧行` : '';
+    U.toast(`OST 申报表载入成功：表 [${defaultSn}]${dateTip}${volTip}`, 'success');
   }
 
   function rebuildDailyOutput() {
