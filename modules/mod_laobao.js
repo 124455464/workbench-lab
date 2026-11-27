@@ -1,17 +1,22 @@
 /**
  * 模块 5：劳保物资发放统计 & 中/印双花名册批量交叉核对（实验隔离版 · 纯劳保口径）
  * 核心铁律：
- * 1. 支持分别导入【中方人员名单】与【印方人员名单】，双库联合核对。
- * 2. 支持一次批量多选/多拖导入多份车间劳保申请表（串行稳妥解析，零状态冲突），支持单车间查看与全车间汇总。
+ * 1. 支持分别导入【中方人员名单】与【印方人员名单】，双库真实持久化到本机 IndexedDB（刷新不丢、绝不假绿灯），导入/更新名单后自动重核已导入车间。
+ * 2. 支持一次批量多选/多拖导入多份车间劳保申请表（含单表 Sheet1、两行合并表头、小车间与宽表矩阵），串行稳妥解析、零状态冲突。
  * 3. 休假人员不用管（直接跳过不核对），仅处理未休假的实际申领人员。
  * 4. 纯劳保口径：自动剔除全部纸巾类（纸巾/抽纸/卷纸/卫生纸/面巾纸/擦手纸/餐巾纸）。
  */
 (function () {
   'use strict';
   const U = WB.Utils;
+  const SCHEMA_VER = 2;
+  const ROSTER_IDB_NAME = 'WB_LaoBao_Rosters_v1';
+  const ROSTER_IDB_KEY = 'rosters_v1';
 
   const EXCLUDE_NON_LAOBAO = ['纸巾', '抽纸', '卷纸', '卫生纸', '面巾纸', '擦手纸', '餐巾纸'];
-  const META_COL_RE = /^(序号|no\.?|岗位分类|岗位名称|岗位|部门|车间|公司|姓名|领用人|人员|id卡号|id|工号|nik|状态|是否休假|休假|备注|说明|正确id|照片)$/i;
+  const META_COL_RE = /^(序号|no\.?|编号|岗位分类|岗位名称|岗位|职位|工种|部门|车间|班组|单位|公司|姓名|中文名|印方姓名|领用人|领料人|人员|员工|name|nama|id卡号|id号|卡号|工号|id|nik|状态|是否休假|休假|请假|在岗|在职|备注|说明|正确id|照片|签字|签名|领用签字|领取签字|日期|时间|合计|总计|小计)$/i;
+  const GENERIC_GROUP_RE = /^(劳保物资|劳保用品|领用物资|劳保明细|申领物资|发放物资|物资名称|物品)$/i;
+  const PPE_HINT_RE = /手套|口罩|过滤棉|滤棉|滤盒|滤毒|劳保|安全帽|耳塞|耳罩|安全鞋|劳保鞋|胶鞋|雨鞋|水鞋|眼镜|护目镜|面罩|面屏|围裙|套袖|袖套|工作服|防护服|雨衣|反光|毛巾|肥皂|香皂|洗衣粉|鞋垫|袜|防尘|防毒|焊|电工|耐酸|耐油|帆布|尼龙|线手套|浸胶|丁腈|乳胶/i;
 
   let state = {
     viewMode: 'items',       // 'items' | 'issues' | 'workshops' | 'detail'
@@ -27,14 +32,61 @@
     idRosterFileName: '',
     idByNik: {},             // nikUpper -> { company, name, status, dept, nik }
     // 批量导入的各车间劳保表（按 fileName 去重存储，支持多表连算）
-    workshops: [],           // [{ fileName, sheetName, expectedCompany, activePeople, cnActive, idActive, leaveSkipped, itemMap, issues, details }]
+    workshops: [],           // [{ fileName, sheetName, expectedCompany, activePeople, cnActive, idActive, leaveSkipped, itemMap, people, issues, details }]
     workshopFilter: 'ALL',   // 'ALL' | fileName
     page: 1
   };
 
+  /** 本地 IndexedDB 真实持久化花名册索引（不占 Gist 体积，刷新后 100% 恢复可核对） */
+  function openRosterDb() {
+    return new Promise((resolve, reject) => {
+      if (typeof indexedDB === 'undefined') return reject(new Error('no indexedDB'));
+      const req = indexedDB.open(ROSTER_IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains('kv')) req.result.createObjectStore('kv');
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function saveLocalRosters() {
+    try {
+      const db = await openRosterDb();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('kv', 'readwrite');
+        tx.objectStore('kv').put({
+          cnById: state.cnById,
+          cnByName: state.cnByName,
+          cnRosterCount: state.cnRosterCount,
+          cnRosterFileName: state.cnRosterFileName,
+          idByNik: state.idByNik,
+          idRosterCount: state.idRosterCount,
+          idRosterHjfCount: state.idRosterHjfCount,
+          idRosterOstCount: state.idRosterOstCount,
+          idRosterFileName: state.idRosterFileName
+        }, ROSTER_IDB_KEY);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch { /* ignore */ }
+  }
+
+  async function loadLocalRosters() {
+    try {
+      const db = await openRosterDb();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction('kv', 'readonly');
+        const req = tx.objectStore('kv').get(ROSTER_IDB_KEY);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch { return null; }
+  }
+
   function persistState() {
-    // 仅持久化轻量统计结果与元信息，避免大花名册超浏览器存储上限
     WB.Store.save('mod_laobao', {
+      schemaVer: SCHEMA_VER,
       viewMode: state.viewMode,
       cnRosterCount: state.cnRosterCount,
       cnRosterFileName: state.cnRosterFileName,
@@ -49,16 +101,32 @@
 
   async function hydrateState() {
     const saved = await WB.Store.load('mod_laobao');
-    if (saved) {
+    if (saved && saved.schemaVer === SCHEMA_VER) {
       state.viewMode = saved.viewMode || 'items';
-      state.cnRosterCount = saved.cnRosterCount || 0;
-      state.cnRosterFileName = saved.cnRosterFileName || '';
-      state.idRosterCount = saved.idRosterCount || 0;
-      state.idRosterHjfCount = saved.idRosterHjfCount || 0;
-      state.idRosterOstCount = saved.idRosterOstCount || 0;
-      state.idRosterFileName = saved.idRosterFileName || '';
       state.workshops = Array.isArray(saved.workshops) ? saved.workshops : [];
       state.workshopFilter = saved.workshopFilter || 'ALL';
+    } else {
+      state.workshops = [];
+      state.workshopFilter = 'ALL';
+    }
+
+    // 从本地 IndexedDB 真实恢复中/印花名册索引（若内存中没有真实索引，强制归 0，杜绝假绿灯）
+    const rosters = await loadLocalRosters();
+    if (rosters) {
+      state.cnById = rosters.cnById || {};
+      state.cnByName = rosters.cnByName || {};
+      state.cnRosterCount = (Object.keys(state.cnById).length || Object.keys(state.cnByName).length) ? (rosters.cnRosterCount || 0) : 0;
+      state.cnRosterFileName = state.cnRosterCount ? (rosters.cnRosterFileName || '') : '';
+
+      state.idByNik = rosters.idByNik || {};
+      state.idRosterCount = Object.keys(state.idByNik).length ? (rosters.idRosterCount || 0) : 0;
+      state.idRosterHjfCount = state.idRosterCount ? (rosters.idRosterHjfCount || 0) : 0;
+      state.idRosterOstCount = state.idRosterCount ? (rosters.idRosterOstCount || 0) : 0;
+      state.idRosterFileName = state.idRosterCount ? (rosters.idRosterFileName || '') : '';
+    } else {
+      state.cnRosterCount = Object.keys(state.cnById).length || Object.keys(state.cnByName).length ? state.cnRosterCount : 0;
+      state.idRosterCount = Object.keys(state.idByNik).length ? state.idRosterCount : 0;
+      if (!state.idRosterCount) { state.idRosterHjfCount = 0; state.idRosterOstCount = 0; }
     }
   }
 
@@ -82,6 +150,96 @@
     const m = s.match(/\b(KPS|CKM|BJL|HJS|ONC|HPL|DPL)\b/) || s.match(/^(KPS|CKM|BJL|HJS|ONC|HPL|DPL)/);
     if (m) return m[1];
     return fallback;
+  }
+
+  /** 对单个未休假人员执行中/印双花名册交叉核对 */
+  function auditSinglePerson(p, fileName, expectedCompany) {
+    const hasCnRoster = Object.keys(state.cnById).length > 0 || Object.keys(state.cnByName).length > 0;
+    const hasIdRoster = Object.keys(state.idByNik).length > 0;
+    const { seq, dept, name, idRaw, rem } = p;
+    const isCn = isChineseName(name);
+
+    let issueType = '';
+    let issueDesc = '';
+    if (!idRaw) {
+      issueType = '缺失ID卡号';
+      issueDesc = rem || '未填写ID卡号/工号';
+    } else if (isCn) {
+      if (hasCnRoster) {
+        const hit = state.cnById[idRaw];
+        if (hit) {
+          if (hit.leftDate) {
+            issueType = '中方已离职';
+            issueDesc = `中方花名册已登记离职（离职日期: ${hit.leftDate}，${hit.dept}）`;
+          } else if (hit.company !== '未知' && hit.company !== expectedCompany) {
+            issueType = `串公司(${hit.company})`;
+            issueDesc = `中方花名册归属 ${hit.company}（${hit.dept} / ${hit.workshop}）`;
+          }
+        } else {
+          // 兜底：部分印方翻译姓名带中文译名（如 Carina...马福佳），顺手核查印方花名册
+          const idFallback = hasIdRoster ? state.idByNik[idRaw] : null;
+          if (idFallback) {
+            if (idFallback.company !== expectedCompany) {
+              issueType = `串公司(${idFallback.company})`;
+              issueDesc = `印方花名册归属 ${idFallback.company}（${idFallback.dept || '未知部门'}，状态:${idFallback.status}）`;
+            } else if (idFallback.status && !/aktif|active|在职/i.test(idFallback.status)) {
+              issueType = `印方非在职(${idFallback.status})`;
+              issueDesc = `印方花名册状态为 ${idFallback.status}`;
+            }
+          } else {
+            const nameHits = state.cnByName[name] || [];
+            if (nameHits.length > 0) {
+              const first = nameHits[0];
+              if (first.leftDate) {
+                issueType = '中方已离职';
+                issueDesc = `按姓名匹配已离职（离职日期: ${first.leftDate}，原ID: ${first.id || '无'}）`;
+              } else {
+                issueType = '中方ID不符';
+                issueDesc = `花名册同名人员ID为 ${first.id || '空'}（${first.dept}/${first.workshop}）`;
+              }
+            } else {
+              issueType = '中方名单查无此人';
+              issueDesc = '在中方人员ID卡信息表中未查到该ID与姓名';
+            }
+          }
+        }
+      }
+    } else {
+      if (hasIdRoster) {
+        const hit = state.idByNik[idRaw];
+        if (hit) {
+          if (hit.company !== expectedCompany) {
+            issueType = `串公司(${hit.company})`;
+            issueDesc = `印方花名册归属 ${hit.company}（${hit.dept || '未知部门'}，状态:${hit.status}）`;
+          } else if (hit.status && !/aktif|active|在职/i.test(hit.status)) {
+            issueType = `印方非在职(${hit.status})`;
+            issueDesc = `印方花名册状态为 ${hit.status}`;
+          }
+        } else {
+          issueType = '印方名单查无此ID';
+          issueDesc = '在 MP HJF / MP OST 中均未匹配到该 NIK（可能离职/工号错误）';
+        }
+      }
+    }
+
+    if (!issueType) return null;
+    return [fileName, seq, dept, name, idRaw, isCn ? '中方' : '印方', issueType, issueDesc];
+  }
+
+  /** 当导入/更新中或印方花名册时，自动对所有已载入车间重新核对问题人员 */
+  function reAuditAllWorkshops() {
+    let totalIssues = 0;
+    state.workshops.forEach(w => {
+      if (!Array.isArray(w.people)) return;
+      const issues = [];
+      w.people.forEach(p => {
+        const row = auditSinglePerson(p, w.fileName, w.expectedCompany);
+        if (row) issues.push(row);
+      });
+      w.issues = issues;
+      totalIssues += issues.length;
+    });
+    return totalIssues;
   }
 
   /** 1. 导入中方人员名单（如 人员ID卡信息表7.10(1).xlsx） */
@@ -133,8 +291,11 @@
     state.cnByName = byName;
     state.cnRosterCount = count;
     state.cnRosterFileName = file.name;
+    const reCnt = state.workshops.length ? reAuditAllWorkshops() : 0;
+    await saveLocalRosters();
     persistState();
-    U.toast(`中方人员名单载入成功：共 ${count} 人索引`, 'success');
+    const extra = state.workshops.length ? `（已自动重核 ${state.workshops.length} 个车间，检出问题人员 ${reCnt} 人）` : '';
+    U.toast(`中方人员名单载入成功：共 ${count} 人索引${extra}`, 'success');
   }
 
   /** 2. 导入印方人员名单（如 印方人员名单_11.16_(1).xlsx） */
@@ -187,11 +348,14 @@
     state.idRosterOstCount = ostCnt;
     state.idRosterCount = total;
     state.idRosterFileName = file.name;
+    const reCnt = state.workshops.length ? reAuditAllWorkshops() : 0;
+    await saveLocalRosters();
     persistState();
-    U.toast(`印方人员名单载入成功：HJF ${hjfCnt} 人 / OST ${ostCnt} 人（共 ${total} 人索引）`, 'success');
+    const extra = state.workshops.length ? `（已自动重核 ${state.workshops.length} 个车间，检出问题人员 ${reCnt} 人）` : '';
+    U.toast(`印方人员名单载入成功：HJF ${hjfCnt} 人 / OST ${ostCnt} 人（共 ${total} 人索引）${extra}`, 'success');
   }
 
-  /** 解析单份车间劳保申请表（不修改全局状态，保证批量连算零冲突） */
+  /** 解析单份车间劳保申请表（兼容 Sheet1、两行合并表头、小车间表、宽表矩阵与竖表） */
   async function parseSingleWorkshopFile(file) {
     const parsed = await U.readSpreadsheet(file);
     let targetSn = parsed.sheetNames[0];
@@ -199,18 +363,36 @@
     let bestHdrIdx = 0;
 
     for (const sn of parsed.sheetNames) {
-      if (/^(Sheet\d+|纸巾领用|无ID信息|问题人员名单|车间物资明细)$/i.test(sn)) continue;
+      // 仅排除明确的非车间明细辅助表；绝不再一刀切跳过 Sheet1！
+      if (/^(纸巾领用|无ID信息.*|问题人员名单|车间物资明细|汇总|总汇总)$/i.test(sn.trim())) continue;
       const aoa = parsed.sheets[sn] || [];
       if (aoa.length < 2) continue;
-      for (let i = 0; i < Math.min(8, aoa.length); i++) {
-        const line = aoa[i].map(v => U.cleanStr(v)).join(' ');
+
+      const isGenericSheet = /^Sheet\d+$/i.test(sn.trim());
+      for (let i = 0; i < Math.min(30, aoa.length); i++) {
+        const cells = aoa[i].map(v => U.cleanStr(v));
+        const line = cells.join(' ');
+        const nextLine = (aoa[i + 1] || []).map(v => U.cleanStr(v)).join(' ');
+        const combined = `${line} ${nextLine}`;
         let score = 0;
-        if (/姓名|领用人/.test(line)) score += 4;
-        if (/ID卡号|工号|NIK/i.test(line)) score += 4;
-        if (/休假|状态/.test(line)) score += 2;
-        if (/手套|口罩|过滤棉|劳保|安全帽/.test(line)) score += 3;
-        if (/名单|明细/.test(sn)) score += 3;
-        if (score > bestScore && aoa.length > 5) {
+
+        // 强力跳过同一张表上半部的「通用物资领料申报单」汇总区（含 存货编码 / 仓库名称 / 规格型号），精准锁定下半部真正的人员明细表头
+        const isRequisitionBanner = /存货编码|物资编码|物料编码/.test(line) && /仓库名称|规格型号|存货名称|领用数量/.test(line);
+        if (isRequisitionBanner) score -= 25;
+
+        if (/姓名|\bNama\b|\bName\b/i.test(line)) score += 10;
+        else if (/领用人|领料人|员工名/.test(line)) score += 4;
+        if (/ID卡号|ID号|卡号|工号|\bNIK\b/i.test(line)) score += 10;
+        if (/休假|状态|请假|在岗/.test(line)) score += 4;
+        if (PPE_HINT_RE.test(line)) score += 4;
+        else if (PPE_HINT_RE.test(combined)) score += 2;
+        if (/名单|明细|劳保/.test(sn)) score += 3;
+        if (!isGenericSheet) score += 1;
+        if (aoa.length > 5) score += 1;
+        const nonEmptyCells = cells.filter(v => v !== '').length;
+        if (nonEmptyCells < 3) score -= 10;
+
+        if (score > bestScore) {
           bestScore = score;
           targetSn = sn;
           bestHdrIdx = i;
@@ -220,18 +402,55 @@
 
     const aoa = parsed.sheets[targetSn] || [];
     if (aoa.length < 2) throw new Error(`[${file.name}] 无有效数据`);
+    if (bestScore < 6) {
+      throw new Error(`[${file.name}] 表[${targetSn}]未识别到标准劳保人员表头（缺少 姓名/Nama 与 工号/ID卡号/NIK 列），请检查表格格式`);
+    }
 
-    const rawH = aoa[bestHdrIdx].map(v => U.cleanStr(v).replace(/\s+/g, ' '));
-    let lastCol = rawH.length - 1;
-    while (lastCol >= 0 && !rawH[lastCol]) lastCol--;
-    const h = rawH.slice(0, lastCol + 1);
+    // 合并可能存在的「两行合并表头」（如主表头写“劳保物资”，下一行写“帆布手套 / 口罩 / 安全帽”）
+    const mainH = aoa[bestHdrIdx].map(v => U.cleanStr(v).replace(/\s+/g, ' '));
+    const subRow = aoa[bestHdrIdx + 1] ? aoa[bestHdrIdx + 1].map(v => U.cleanStr(v).replace(/\s+/g, ' ')) : [];
+    const maxCols = Math.max(mainH.length, subRow.length);
+
+    let iNameTmp = mainH.findIndex(x => /姓名|^Name$|^Nama$/i.test(x));
+    if (iNameTmp < 0) iNameTmp = mainH.findIndex(x => /领用人|领料人|员工名/.test(x));
+    let iIdTmp = mainH.findIndex(x => /ID卡号|ID号|卡号|工号|^NIK$|^ID$/i.test(x));
+
+    // 判断 bestHdrIdx + 1 是否是二级表头：在姓名/ID列为空（纵向合并），且其他列出现具体劳保品名或单位
+    let hasSubHeader = false;
+    if (subRow.length > 0) {
+      const nameCellSub = iNameTmp >= 0 ? (subRow[iNameTmp] || '') : '';
+      const idCellSub = iIdTmp >= 0 ? (subRow[iIdTmp] || '') : '';
+      const subPpeHits = subRow.filter(x => x && PPE_HINT_RE.test(x)).length;
+      const subTextNonNum = subRow.filter((x, idx) => idx !== iNameTmp && idx !== iIdTmp && x && !/^\d+(\.\d+)?$/.test(x) && !/^(是|否|yes|no)$/i.test(x)).length;
+      if (!nameCellSub && !idCellSub && (subPpeHits >= 1 || subTextNonNum >= 3)) {
+        hasSubHeader = true;
+      }
+    }
+
+    const h = [];
+    for (let c = 0; c < maxCols; c++) {
+      const m = mainH[c] || '';
+      const s = hasSubHeader ? (subRow[c] || '') : '';
+      if (hasSubHeader && s && (!m || GENERIC_GROUP_RE.test(m))) {
+        h.push(s);
+      } else if (hasSubHeader && s && m && !m.includes(s)) {
+        h.push(`${m}${s}`);
+      } else {
+        h.push(m || s);
+      }
+    }
+    while (h.length > 0 && !h[h.length - 1]) h.pop();
+
+    const dataStartIdx = bestHdrIdx + (hasSubHeader ? 2 : 1);
 
     const iSeq = h.findIndex(x => /^序号|no\.?$/i.test(x));
-    const iDept = h.findIndex(x => /岗位分类|部门|车间/.test(x));
-    const iRole = h.findIndex(x => /岗位名称|岗位/.test(x) && !/分类/.test(x));
-    const iName = h.findIndex(x => /姓名|领用人|人员/.test(x));
-    const iId = h.findIndex(x => /ID卡号|工号|NIK|^ID$/i.test(x));
-    const iLeave = h.findIndex(x => /休假|状态/.test(x));
+    const iDept = h.findIndex(x => /岗位分类|部门|车间|班组/.test(x));
+    const iRole = h.findIndex(x => /岗位名称|岗位|工种|职位/.test(x) && !/分类/.test(x));
+    // 严格优先匹配「姓名 / Nama / Name」，避免同表出现「领用人」列时抓错成代领人
+    let iName = h.findIndex(x => /姓名|^Name$|^Nama$/i.test(x));
+    if (iName < 0) iName = h.findIndex(x => /领用人|领料人|员工名/.test(x));
+    const iId = h.findIndex(x => /ID卡号|ID号|卡号|工号|^NIK$|^ID$/i.test(x));
+    const iLeave = h.findIndex(x => /休假|状态|请假|在岗/.test(x));
     const iRem = h.findIndex(x => /备注|说明/.test(x));
 
     const ppeCols = [];
@@ -239,7 +458,9 @@
     h.forEach((colName, idx) => {
       if (!colName) return;
       if ([iSeq, iDept, iRole, iName, iId, iLeave, iRem].includes(idx)) return;
-      if (META_COL_RE.test(colName.replace(/（.*?）|\(.*?\)/g, '').trim())) return;
+      const stripped = colName.replace(/（.*?）|\(.*?\)/g, '').trim();
+      if (!stripped || /^\d+$/.test(stripped)) return;
+      if (META_COL_RE.test(stripped) || GENERIC_GROUP_RE.test(stripped)) return;
       if (isTissueName(colName)) {
         excludedTissueCols++;
         return;
@@ -247,12 +468,11 @@
       ppeCols.push({ idx, name: colName.replace(/\n+/g, '') });
     });
 
-    const isMatrix = ppeCols.length >= 2 && iName >= 0;
+    const isMatrix = ppeCols.length >= 1 && iName >= 0;
     const expectedCompany = detectCompanyFromText(`${file.name} ${targetSn}`, 'HJF');
-    const hasCnRoster = Object.keys(state.cnById).length > 0;
-    const hasIdRoster = Object.keys(state.idByNik).length > 0;
 
     const itemMap = {};      // itemName -> { qty, people }
+    const people = [];       // [{ seq, dept, name, idRaw, rem }] 留存以便导入新花名册后自动重核
     const issues = [];       // [来源表, 序号, 岗位/部门, 姓名, ID卡号, 中/印方, 问题类型, 花名册核对说明]
     const details = [];      // [来源表, 岗位/部门, 姓名, 纯劳保物资, 数量]
     let activePeople = 0;
@@ -261,17 +481,19 @@
     let leaveSkipped = 0;
 
     if (isMatrix) {
-      for (let i = bestHdrIdx + 1; i < aoa.length; i++) {
+      for (let i = dataStartIdx; i < aoa.length; i++) {
         const r = aoa[i];
         const name = iName >= 0 ? U.cleanStr(r[iName]) : '';
         const idRaw = iId >= 0 ? normId(r[iId]) : '';
-        const dept = iDept >= 0 ? U.cleanStr(r[iDept]) : (iRole >= 0 ? U.cleanStr(r[iRole]) : '未分部门');
+        const dept = iDept >= 0 ? U.cleanStr(r[iDept]) : (iRole >= 0 ? U.cleanStr(r[iRole]) : file.name.replace(/\.[^.]+$/, ''));
         if (!name && !idRaw) continue;
-        if (/^(合计|总计|小计)$/.test(name) || /^(合计|总计|小计)$/.test(dept)) continue;
+        if (/^(合计|总计|小计|汇总|人数|统计|制表|审核|审批|签字)/.test(name) || /^(合计|总计|小计|汇总)/.test(dept)) continue;
+        // 跳过重复表头行
+        if (/^(姓名|领用人|Name|Nama)$/i.test(name)) continue;
 
-        // 铁律：休假人员不用管，直接跳过，仅处理未休假人员
+        // 铁律：休假/休息/Cuti 人员不用管，直接跳过，仅处理未休假人员
         const leaveRaw = iLeave >= 0 ? U.cleanStr(r[iLeave]) : '';
-        const isLeave = /^(是|休假|请假|离职|yes|y)$/i.test(leaveRaw);
+        const isLeave = /^(是|yes|y)$/i.test(leaveRaw) || /休假|请假|休息|离职|回国|不在岗|cuti|resign/i.test(leaveRaw);
         if (isLeave) {
           leaveSkipped++;
           continue;
@@ -296,96 +518,57 @@
           }
         });
 
-        // 中/印双花名册交叉核对（仅未休假人员）
-        let issueType = '';
-        let issueDesc = '';
-        if (!idRaw) {
-          issueType = '缺失ID卡号';
-          issueDesc = rem || '未填写ID卡号/工号';
-        } else if (isCn) {
-          if (hasCnRoster) {
-            const hit = state.cnById[idRaw];
-            if (hit) {
-              if (hit.leftDate) {
-                issueType = '中方已离职';
-                issueDesc = `中方花名册已登记离职（离职日期: ${hit.leftDate}，${hit.dept}）`;
-              } else if (hit.company !== '未知' && hit.company !== expectedCompany) {
-                issueType = `串公司(${hit.company})`;
-                issueDesc = `中方花名册归属 ${hit.company}（${hit.dept} / ${hit.workshop}）`;
-              }
-            } else {
-              // 兜底：部分印方翻译姓名带中文译名（如 Carina...马福佳），顺手核查印方花名册
-              const idFallback = hasIdRoster ? state.idByNik[idRaw] : null;
-              if (idFallback) {
-                if (idFallback.company !== expectedCompany) {
-                  issueType = `串公司(${idFallback.company})`;
-                  issueDesc = `印方花名册归属 ${idFallback.company}（${idFallback.dept || '未知部门'}，状态:${idFallback.status}）`;
-                } else if (idFallback.status && !/aktif|active|在职/i.test(idFallback.status)) {
-                  issueType = `印方非在职(${idFallback.status})`;
-                  issueDesc = `印方花名册状态为 ${idFallback.status}`;
-                }
-              } else {
-                const nameHits = state.cnByName[name] || [];
-                if (nameHits.length > 0) {
-                  const first = nameHits[0];
-                  if (first.leftDate) {
-                    issueType = '中方已离职';
-                    issueDesc = `按姓名匹配已离职（离职日期: ${first.leftDate}，原ID: ${first.id || '无'}）`;
-                  } else {
-                    issueType = '中方ID不符';
-                    issueDesc = `花名册同名人员ID为 ${first.id || '空'}（${first.dept}/${first.workshop}）`;
-                  }
-                } else {
-                  issueType = '中方名单查无此人';
-                  issueDesc = '在中方人员ID卡信息表中未查到该ID与姓名';
-                }
-              }
-            }
-          }
-        } else {
-          if (hasIdRoster) {
-            const hit = state.idByNik[idRaw];
-            if (hit) {
-              if (hit.company !== expectedCompany) {
-                issueType = `串公司(${hit.company})`;
-                issueDesc = `印方花名册归属 ${hit.company}（${hit.dept || '未知部门'}，状态:${hit.status}）`;
-              } else if (hit.status && !/aktif|active|在职/i.test(hit.status)) {
-                issueType = `印方非在职(${hit.status})`;
-                issueDesc = `印方花名册状态为 ${hit.status}`;
-              }
-            } else {
-              issueType = '印方名单查无此ID';
-              issueDesc = '在 MP HJF / MP OST 中均未匹配到该 NIK（可能离职/工号错误）';
-            }
-          }
-        }
-
-        if (issueType) {
-          issues.push([file.name, seq, dept, name, idRaw, isCn ? '中方' : '印方', issueType, issueDesc]);
-        }
+        const personRec = { seq, dept, name, idRaw, rem };
+        people.push(personRec);
+        const issueRow = auditSinglePerson(personRec, file.name, expectedCompany);
+        if (issueRow) issues.push(issueRow);
       }
     } else {
-      // 兼容传统竖表明细格式
-      const iItem = h.findIndex(x => /物资|名称|品名|劳保/.test(x) && !/部门|岗位|公司/.test(x));
-      const iQty = h.findIndex(x => /数量|实发|发放/.test(x));
-      for (let i = bestHdrIdx + 1; i < aoa.length; i++) {
+      // 兼容传统竖表明细格式（严禁误把序号列当物资名，且照常执行中/印统计与花名册核对）
+      const iItem = h.findIndex((x, idx) => idx !== iSeq && idx !== iName && idx !== iId && /物资|品名|名称|劳保|用品/.test(x) && !/部门|岗位|公司|姓名/.test(x));
+      const iQty = h.findIndex((x, idx) => idx !== iSeq && /数量|实发|发放|申领/.test(x));
+      if (iItem < 0) {
+        throw new Error(`[${file.name}] 表[${targetSn}]既无横向劳保物资列，也无竖表【物资名称】列，无法统计`);
+      }
+
+      const seenPerson = new Set();
+      for (let i = dataStartIdx; i < aoa.length; i++) {
         const r = aoa[i];
         const dept = iDept >= 0 ? U.cleanStr(r[iDept]) : '未分部门';
         const person = iName >= 0 ? U.cleanStr(r[iName]) : '';
-        const item = iItem >= 0 ? U.cleanStr(r[iItem]) : '';
+        const idRaw = iId >= 0 ? normId(r[iId]) : '';
+        const item = U.cleanStr(r[iItem]);
         const qty = iQty >= 0 ? U.parseNum(r[iQty]) : 1;
         const leaveRaw = iLeave >= 0 ? U.cleanStr(r[iLeave]) : '';
-        if (!person && !item) continue;
-        if (/^(合计|总计|小计)$/.test(dept) || /^(合计|总计|小计)$/.test(person)) continue;
+        if (!item || /^\d+$/.test(item) || GENERIC_GROUP_RE.test(item)) continue;
+        if (/^(合计|总计|小计|汇总)/.test(dept) || /^(合计|总计|小计|汇总)/.test(person) || /^(合计|总计|小计|汇总)/.test(item)) continue;
         if (/^(是|休假|请假|离职|yes|y)$/i.test(leaveRaw)) { leaveSkipped++; continue; }
         if (isTissueName(item)) { excludedTissueCols++; continue; }
-        activePeople++;
-        const k = item || '劳保物资';
-        if (!itemMap[k]) itemMap[k] = { qty: 0, people: 0 };
-        itemMap[k].qty += qty;
-        itemMap[k].people += 1;
-        details.push([file.name, dept, person, k, qty]);
+        if (qty <= 0) continue;
+
+        if (!itemMap[item]) itemMap[item] = { qty: 0, people: 0 };
+        itemMap[item].qty += qty;
+        itemMap[item].people += 1;
+        details.push([file.name, dept, person || '-', item, qty]);
+
+        const pKey = `${person}||${idRaw}`;
+        if (person && !seenPerson.has(pKey)) {
+          seenPerson.add(pKey);
+          activePeople++;
+          if (isChineseName(person)) cnActive++;
+          else idActive++;
+          const seq = iSeq >= 0 ? U.cleanStr(r[iSeq]) : String(activePeople);
+          const rem = iRem >= 0 ? U.cleanStr(r[iRem]) : '';
+          const personRec = { seq, dept, name: person, idRaw, rem };
+          people.push(personRec);
+          const issueRow = auditSinglePerson(personRec, file.name, expectedCompany);
+          if (issueRow) issues.push(issueRow);
+        }
       }
+    }
+
+    if (activePeople === 0 && Object.keys(itemMap).length === 0) {
+      throw new Error(`[${file.name}] 表[${targetSn}]未提取到有效未休假发放记录`);
     }
 
     return {
@@ -398,6 +581,7 @@
       leaveSkipped,
       excludedTissueCols,
       itemMap,
+      people,
       issues,
       details
     };
@@ -413,7 +597,6 @@
     for (const f of files) {
       try {
         const res = await parseSingleWorkshopFile(f);
-        // 同名文件覆盖更新，不同车间文件累加保存
         const idx = state.workshops.findIndex(w => w.fileName === res.fileName);
         if (idx >= 0) state.workshops[idx] = res;
         else state.workshops.push(res);
@@ -459,7 +642,9 @@
       (w.details || []).forEach(r => allDetails.push(r));
     });
 
-    const itemRows = Array.from(itemTotals.entries()).map(([name, info]) => [name, U.fmtNum(info.qty), info.people]);
+    const itemRows = Array.from(itemTotals.entries())
+      .filter(([, info]) => info.qty > 0)
+      .map(([name, info]) => [name, U.fmtNum(info.qty), info.people]);
     const wsRows = state.workshops.map(w => [
       w.fileName,
       w.sheetName,
