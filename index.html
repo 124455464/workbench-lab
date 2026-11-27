@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>HJF / OST 仓储可视化工作台 v1.0（模块化隔离架构）</title>
-  <!-- 外部库：SheetJS + PDF.js/Tesseract.js(defer异步加载不阻塞首屏渲染) -->
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- 外部库：xlsx-js-style（支持样式导出） + PDF.js/Tesseract.js(defer异步加载不阻塞首屏渲染) -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
@@ -210,11 +210,48 @@
     </div>
     <div style="display:flex;align-items:center;gap:8px;">
       <span id="wb-bg-pill" title="点击跳转查看后台识别结果" style="display:none;cursor:pointer;padding:4px 10px;border-radius:999px;font-size:11.5px;font-weight:600;background:#1d4ed8;color:#dbeafe;"></span>
+      <span id="wb-fmt-pill" title="粘贴原表格1个单元格即可自动吸取本板块专属格式（复制与导出同步生效，各板块互不影响）" style="cursor:pointer;padding:4px 10px;border-radius:999px;font-size:11.5px;font-weight:600;background:#334155;color:#e2e8f0;">
+        🖌️ 格式刷：默认
+      </span>
       <span id="wb-sync-pill" title="点击配置跨电脑实时云运输（私有独立实验 Gist）" style="cursor:pointer;padding:4px 10px;border-radius:999px;font-size:11.5px;font-weight:600;background:#166534;color:#dcfce7;">
         ☁️ 实时运输已就绪
       </span>
     </div>
   </header>
+
+  <!-- 分板块独立格式刷弹窗（Ctrl+V 粘贴单元格自动吸取字体/字号/对齐/框线） -->
+  <div id="fmt-modal" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:9998;align-items:center;justify-content:center;">
+    <div style="background:#fff;border-radius:12px;padding:18px 20px;width:92%;max-width:480px;box-shadow:0 12px 32px rgba(0,0,0,.25);">
+      <div style="font-weight:700;font-size:15px;margin-bottom:6px;">🖌️ 格式刷自动吸取（各板块完全独立，互不影响）</div>
+      <div id="fmt-mod-label" style="font-size:12px;color:#0369a1;margin-bottom:10px;font-weight:600;"></div>
+      <div id="fmt-paste-zone" contenteditable="true" style="border:2px dashed #3b82f6;background:#eff6ff;border-radius:8px;padding:16px 12px;text-align:center;color:#1d4ed8;font-size:13px;cursor:text;outline:none;margin-bottom:12px;min-height:66px;">
+        📋 在原 Excel / WPS 里随便复制 1 个单元格（Ctrl+C），点这里按 <b>Ctrl+V</b>，立刻自动识别字体/字号/对齐/边框！
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;font-size:12px;">
+        <label>字体名称：<input id="fmt-font" type="text" placeholder="如：宋体 / 微软雅黑" style="width:100%;margin-top:3px;" /></label>
+        <label>字号 (pt)：<input id="fmt-size" type="text" placeholder="如：11" style="width:100%;margin-top:3px;" /></label>
+        <label>对齐方式：
+          <select id="fmt-align" style="width:100%;margin-top:3px;">
+            <option value="left">左对齐</option>
+            <option value="center">居中</option>
+            <option value="right">右对齐</option>
+          </select>
+        </label>
+        <div style="display:flex;align-items:flex-end;gap:12px;padding-bottom:6px;">
+          <label style="cursor:pointer;"><input id="fmt-bold" type="checkbox" /> 加粗</label>
+          <label style="cursor:pointer;"><input id="fmt-border" type="checkbox" /> 细框线</label>
+        </div>
+      </div>
+      <div style="font-size:11.5px;color:#64748b;margin-bottom:12px;">
+        提示：保存后仅对当前板块的【一键复制】和【导出 Excel】生效（11位编码前导 0 依然强保护），其他板块各自独立。
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button class="btn btn-danger" id="fmt-btn-clear">🔄 恢复默认无格式</button>
+        <button class="btn btn-primary" id="fmt-btn-save">💾 应用到当前板块</button>
+        <button class="btn" id="fmt-btn-close">关闭</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 独立云端实时运输设置弹窗 -->
   <div id="sync-modal" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:9998;align-items:center;justify-content:center;">
@@ -247,7 +284,7 @@
   <div id="wb-toast-box"></div>
 
   <!-- 核心公共库 -->
-  <script src="./core_utils.js?v=20261126"></script>
+  <script src="./core_utils.js?v=20261126b"></script>
   <!-- 7 大独立隔离业务模块（任一模块升级或出错，其余模块 100% 不受影响） -->
   <script src="./modules/mod_hjf_embed.js?v=20261126"></script>
   <script src="./modules/mod_16col_yellow.js?v=20261124"></script>
@@ -283,11 +320,28 @@
         });
       }
 
+      function updateFmtPill() {
+        const pill = document.getElementById('wb-fmt-pill');
+        if (!pill || !WB.Format) return;
+        const fmt = WB.Format.get(activeId);
+        if (fmt && fmt.enabled) {
+          pill.style.background = '#7c3aed';
+          pill.style.color = '#f5f3ff';
+          pill.textContent = `🖌️ 格式：${fmt.fontName} ${fmt.fontSize}pt${fmt.border ? ' 框' : ''}`;
+        } else {
+          pill.style.background = '#334155';
+          pill.style.color = '#e2e8f0';
+          pill.textContent = '🖌️ 格式刷：默认';
+        }
+      }
+
       async function switchTab(id, autoFiles = null) {
         if (!WB.modules[id]) return;
         activeId = id;
+        WB.activeModId = id;
         try { localStorage.setItem('wb_lab_exp_active_tab', id); } catch {}
         renderTabs();
+        updateFmtPill();
         const main = document.getElementById('main-container');
         main.innerHTML = '';
         try {
@@ -476,6 +530,65 @@
       if (bgPill) {
         bgPill.onclick = () => switchTab('mod_yellow_slip');
       }
+
+      // 绑定分板块独立格式刷弹窗（支持直接 Ctrl+V 粘贴单元格自动识别格式）
+      const fmtModal = document.getElementById('fmt-modal');
+      const fmtPaste = document.getElementById('fmt-paste-zone');
+      let pendingColor = '';
+      function fillFmtInputs(cfg) {
+        document.getElementById('fmt-font').value = (cfg && cfg.fontName) || '宋体';
+        document.getElementById('fmt-size').value = (cfg && cfg.fontSize) || '11';
+        document.getElementById('fmt-align').value = (cfg && cfg.align) || 'left';
+        document.getElementById('fmt-bold').checked = !!(cfg && cfg.bold);
+        document.getElementById('fmt-border').checked = !!(cfg && cfg.border);
+        pendingColor = (cfg && cfg.color) || '';
+      }
+      document.getElementById('wb-fmt-pill').onclick = () => {
+        const mod = WB.modules[activeId];
+        document.getElementById('fmt-mod-label').textContent = `当前正在配置板块：【${mod ? mod.title : activeId}】（独立保存，绝不影响其他板块）`;
+        fillFmtInputs(WB.Format.get(activeId));
+        fmtPaste.innerHTML = '📋 在原 Excel / WPS 里随便复制 1 个单元格（Ctrl+C），点这里按 <b>Ctrl+V</b>，立刻自动识别字体/字号/对齐/边框！';
+        fmtModal.style.display = 'flex';
+        setTimeout(() => fmtPaste.focus(), 50);
+      };
+      fmtPaste.addEventListener('paste', e => {
+        e.preventDefault();
+        const html = e.clipboardData && e.clipboardData.getData('text/html');
+        if (!html) {
+          WB.Utils.toast('未检测到富文本样式，请直接从 Excel / WPS / 在线表格复制单元格后粘贴', 'warn');
+          return;
+        }
+        const detected = WB.Format.parseFromHtml(html);
+        if (!detected) {
+          WB.Utils.toast('未识别到单元格样式，请重新复制 1 个表格单元格粘贴', 'warn');
+          return;
+        }
+        fillFmtInputs(detected);
+        fmtPaste.innerHTML = `✅ 已自动吸取样式：<b>${WB.Utils.escHtml(detected.fontName)} ${detected.fontSize}pt</b> ｜ 对齐：<b>${detected.align}</b> ｜ 框线：<b>${detected.border ? '有' : '无'}</b> ｜ 加粗：<b>${detected.bold ? '是' : '否'}</b>（点下方「应用」即可生效）`;
+        WB.Utils.toast(`已吸取样式：${detected.fontName} ${detected.fontSize}pt`, 'success');
+      });
+      document.getElementById('fmt-btn-save').onclick = () => {
+        const cfg = {
+          enabled: true,
+          fontName: document.getElementById('fmt-font').value.trim() || '宋体',
+          fontSize: parseFloat(document.getElementById('fmt-size').value) || 11,
+          align: document.getElementById('fmt-align').value || 'left',
+          bold: document.getElementById('fmt-bold').checked,
+          border: document.getElementById('fmt-border').checked,
+          color: pendingColor
+        };
+        WB.Format.save(activeId, cfg);
+        updateFmtPill();
+        fmtModal.style.display = 'none';
+        WB.Utils.toast(`已为当前板块启用格式：${cfg.fontName} ${cfg.fontSize}pt（一键复制与导出同步生效）`, 'success');
+      };
+      document.getElementById('fmt-btn-clear').onclick = () => {
+        WB.Format.clear(activeId);
+        updateFmtPill();
+        fmtModal.style.display = 'none';
+        WB.Utils.toast('已恢复当前板块为默认无格式', 'info');
+      };
+      document.getElementById('fmt-btn-close').onclick = () => { fmtModal.style.display = 'none'; };
 
       // 绑定实时运输配置弹窗
       const syncModal = document.getElementById('sync-modal');

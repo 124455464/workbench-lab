@@ -352,23 +352,55 @@
 
     exportWorkbook(sheetConfigs, fileName) {
       const wb = XLSX.utils.book_new();
+      const fmt = Format.get(global.WB && global.WB.activeModId);
+      const borderObj = fmt && fmt.border ? {
+        top: { style: 'thin', color: { rgb: 'BFBFBF' } },
+        bottom: { style: 'thin', color: { rgb: 'BFBFBF' } },
+        left: { style: 'thin', color: { rgb: 'BFBFBF' } },
+        right: { style: 'thin', color: { rgb: 'BFBFBF' } }
+      } : undefined;
+
       sheetConfigs.forEach(cfg => {
         const aoa = [cfg.headers, ...cfg.rows];
         const ws = XLSX.utils.aoa_to_sheet(aoa);
         const textCols = new Set(cfg.textCols || []);
         const numCols = new Set(cfg.numCols || []);
-        for (let r = 1; r < aoa.length; r++) {
+        for (let r = 0; r < aoa.length; r++) {
           for (let c = 0; c < cfg.headers.length; c++) {
             const addr = XLSX.utils.encode_cell({ r, c });
             const cell = ws[addr];
             if (!cell) continue;
-            if (textCols.has(c)) {
-              cell.t = 's';
-              cell.v = String(cell.v ?? '');
-              cell.z = '@';
-            } else if (numCols.has(c) && cell.v !== '' && !isNaN(Number(cell.v))) {
-              cell.t = 'n';
-              cell.v = Number(cell.v);
+            if (r > 0) {
+              if (textCols.has(c)) {
+                cell.t = 's';
+                cell.v = String(cell.v ?? '');
+                cell.z = '@';
+              } else if (numCols.has(c) && cell.v !== '' && !isNaN(Number(cell.v))) {
+                cell.t = 'n';
+                cell.v = Number(cell.v);
+              }
+            }
+            if (fmt && fmt.enabled) {
+              const isHeader = r === 0;
+              cell.s = {
+                font: {
+                  name: fmt.fontName || '宋体',
+                  sz: Number(fmt.fontSize) || 11,
+                  bold: isHeader ? true : !!fmt.bold,
+                  color: fmt.color ? { rgb: fmt.color.replace('#', '') } : undefined
+                },
+                alignment: {
+                  horizontal: isHeader ? 'center' : (fmt.align || 'left'),
+                  vertical: 'center'
+                },
+                border: borderObj
+              };
+              if (isHeader) {
+                cell.s.fill = { fgColor: { rgb: 'F1F5F9' } };
+              }
+              if (r > 0 && textCols.has(c)) {
+                cell.s.numFmt = '@';
+              }
             }
           }
         }
@@ -403,7 +435,45 @@
       for (const row of rows) {
         lines.push(row.map(v => String(v ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t'));
       }
-      return Utils.copyText(lines.join('\n'));
+      const plainText = lines.join('\n');
+
+      // 若当前板块吸取并启用了独立格式，则同时写入带完整样式的 HTML 表格剪贴板（Excel/WPS 直接带字体/字号/边框粘贴）
+      const fmt = Format.get(global.WB && global.WB.activeModId);
+      if (fmt && fmt.enabled && typeof ClipboardItem !== 'undefined' && navigator.clipboard && navigator.clipboard.write) {
+        try {
+          const tdStyle = [
+            `font-family:'${fmt.fontName || '宋体'}',sans-serif`,
+            `font-size:${Number(fmt.fontSize) || 11}pt`,
+            fmt.bold ? 'font-weight:bold' : 'font-weight:normal',
+            `text-align:${fmt.align || 'left'}`,
+            'vertical-align:middle',
+            fmt.color ? `color:${fmt.color}` : '',
+            fmt.border ? 'border:0.5pt solid #8c8c8c' : '',
+            'padding:2px 4px'
+          ].filter(Boolean).join(';');
+
+          const parts = ['<html><head><meta charset="utf-8"></head><body><table style="border-collapse:collapse;">'];
+          if (includeHeader && headers) {
+            parts.push('<tr>' + headers.map(h => `<th style="${tdStyle};font-weight:bold;background:#f1f5f9;">${Utils.escHtml(h)}</th>`).join('') + '</tr>');
+          }
+          for (const row of rows) {
+            parts.push('<tr>' + row.map(v => {
+              const s = String(v ?? '');
+              // 强保前导 0（如 05000... / 日期）不被 Excel 吞掉
+              const forceText = (/^0\d{5,}$/.test(s) || /^\d{4}-\d{2}-\d{2}$/.test(s)) ? ';mso-number-format:"\\@"' : '';
+              return `<td style="${tdStyle}${forceText}">${Utils.escHtml(s)}</td>`;
+            }).join('') + '</tr>');
+          }
+          parts.push('</table></body></html>');
+          const htmlBlob = new Blob([parts.join('')], { type: 'text/html' });
+          const textBlob = new Blob([plainText], { type: 'text/plain' });
+          await navigator.clipboard.write([new ClipboardItem({ 'text/html': htmlBlob, 'text/plain': textBlob })]);
+          return true;
+        } catch (e) {
+          console.warn('[RichCopy fallback to plain]', e);
+        }
+      }
+      return Utils.copyText(plainText);
     },
 
     renderPagedTable(container, { headers, rows, page = 1, pageSize = 100, rowClassFn, cellRenderFn, onPageChange }) {
@@ -467,9 +537,101 @@
     }
   };
 
+  // --- 分板块独立格式刷引擎（支持 Ctrl+V 粘贴单元格自动吸取字体/字号/对齐/框线，按模块独立生效） ---
+  const memFmt = {};
+  const FONT_ALIAS = {
+    'simsun': '宋体',
+    'nsimsun': '新宋体',
+    'microsoft yahei': '微软雅黑',
+    'microsoft yahei ui': '微软雅黑',
+    'dengxian': '等线',
+    'simhei': '黑体',
+    'kaiti': '楷体',
+    'fangsong': '仿宋',
+    'pingfang sc': '微软雅黑'
+  };
+
+  function rgbToHex(rgb) {
+    const m = String(rgb || '').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (!m) return '';
+    const hex = [1, 2, 3].map(i => Number(m[i]).toString(16).padStart(2, '0')).join('').toUpperCase();
+    return (hex === '000000' || hex === '0F172A') ? '' : `#${hex}`;
+  }
+
+  function cleanFontName(raw) {
+    if (!raw) return '宋体';
+    const first = String(raw).split(',')[0].replace(/['"]/g, '').trim();
+    return FONT_ALIAS[first.toLowerCase()] || first || '宋体';
+  }
+
+  const Format = {
+    get(modId) {
+      if (!modId) return null;
+      if (memFmt[modId] !== undefined) return memFmt[modId];
+      try {
+        const raw = localStorage.getItem(`wb_lab_fmt_${modId}`);
+        if (raw) {
+          memFmt[modId] = JSON.parse(raw);
+          return memFmt[modId];
+        }
+      } catch {}
+      return null;
+    },
+    save(modId, cfg) {
+      if (!modId) return;
+      memFmt[modId] = cfg;
+      try {
+        if (cfg) localStorage.setItem(`wb_lab_fmt_${modId}`, JSON.stringify(cfg));
+        else localStorage.removeItem(`wb_lab_fmt_${modId}`);
+      } catch {}
+    },
+    clear(modId) {
+      this.save(modId, null);
+    },
+    /** 从 Excel/WPS/在线表格复制的 HTML 片段中自动吸取字体、字号、加粗、对齐、框线与颜色 */
+    parseFromHtml(html) {
+      if (!html || !document.body) return null;
+      const host = document.createElement('div');
+      host.style.cssText = 'position:fixed;left:-99999px;top:-99999px;visibility:hidden;';
+      host.innerHTML = html;
+      document.body.appendChild(host);
+      try {
+        // 优先取首个非空 <td>，其次 <th>，最后任意元素
+        const cells = Array.from(host.querySelectorAll('td,th'));
+        const target = cells.find(el => (el.textContent || '').trim() !== '') || cells[0] || host.firstElementChild;
+        if (!target) return null;
+
+        const cs = getComputedStyle(target);
+        const fontName = cleanFontName(target.style.fontFamily || cs.fontFamily);
+        let fontSize = 11;
+        const rawSz = target.style.fontSize || cs.fontSize || '';
+        if (/pt$/i.test(rawSz)) {
+          fontSize = Math.round(parseFloat(rawSz) * 2) / 2;
+        } else if (/px$/i.test(rawSz)) {
+          fontSize = Math.round((parseFloat(rawSz) * 0.75) * 2) / 2;
+        }
+        if (!fontSize || fontSize < 6 || fontSize > 48) fontSize = 11;
+
+        const fw = target.style.fontWeight || cs.fontWeight || '';
+        const bold = fw === 'bold' || Number(fw) >= 600;
+        const ta = (target.style.textAlign || cs.textAlign || 'left').toLowerCase();
+        const align = ta.includes('center') ? 'center' : (ta.includes('right') ? 'right' : 'left');
+        const hasBorder = ['borderTopStyle', 'borderBottomStyle', 'borderLeftStyle', 'borderRightStyle']
+          .some(k => cs[k] && cs[k] !== 'none' && cs[k] !== 'hidden');
+        const color = rgbToHex(cs.color);
+
+        return { enabled: true, fontName, fontSize, bold, align, border: hasBorder, color };
+      } finally {
+        document.body.removeChild(host);
+      }
+    }
+  };
+
   global.WB = {
     Utils,
     Store,
+    Format,
+    activeModId: '',
     modules: {},
     register(mod) {
       this.modules[mod.id] = mod;
