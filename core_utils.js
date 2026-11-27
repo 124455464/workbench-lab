@@ -341,7 +341,7 @@
         return { sheetNames, sheets, fileName: file.name };
       }
 
-      const wb = XLSX.read(buf, { type: 'array', raw: false, cellDates: false });
+      const wb = XLSX.read(buf, { type: 'array', raw: false, cellDates: false, cellStyles: true });
       const sheets = {};
       wb.SheetNames.forEach(name => {
         const ws = wb.Sheets[name];

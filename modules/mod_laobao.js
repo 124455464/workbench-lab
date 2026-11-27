@@ -2,19 +2,23 @@
  * 模块 5：劳保物资发放统计 & 中/印双花名册批量交叉核对（实验隔离版 · 纯劳保口径）
  * 核心铁律：
  * 1. 支持分别导入【中方人员名单】与【印方人员名单】，双库真实持久化到本机 IndexedDB（刷新不丢、绝不假绿灯），导入/更新名单后自动重核已导入车间。
- * 2. 支持一次批量多选/多拖导入多份车间劳保申请表（含单表 Sheet1、两行合并表头、小车间与宽表矩阵），串行稳妥解析、零状态冲突。
- * 3. 休假人员不用管（直接跳过不核对），仅处理未休假的实际申领人员。
+ * 2. 支持一次批量多选/多拖导入多份车间劳保申请表：
+ *    - 标准宽表矩阵（如《HJF电厂》）
+ *    - 单表 Sheet1 + 上申报单/下人员名单（如《维修科》《HJF码头》）
+ *    - 同表并排双栏/多栏花名册（左栏印方 No/NIK/Nama + 右栏中方 No/NIK/Nama/Jabatan，自动从上方申报单提取纯劳保汇总，绝不丢任何一栏！）
+ *    - 两行合并表头与小车间表
+ * 3. 休假人员不用管（自动跳过文字“是/休假/休息/Cuti/请假/离职”以及“红色底纹标休假”人员），仅处理未休假的实际申领人员。
  * 4. 纯劳保口径：自动剔除全部纸巾类（纸巾/抽纸/卷纸/卫生纸/面巾纸/擦手纸/餐巾纸）。
  */
 (function () {
   'use strict';
   const U = WB.Utils;
-  const SCHEMA_VER = 2;
+  const SCHEMA_VER = 3;
   const ROSTER_IDB_NAME = 'WB_LaoBao_Rosters_v1';
   const ROSTER_IDB_KEY = 'rosters_v1';
 
   const EXCLUDE_NON_LAOBAO = ['纸巾', '抽纸', '卷纸', '卫生纸', '面巾纸', '擦手纸', '餐巾纸'];
-  const META_COL_RE = /^(序号|no\.?|编号|岗位分类|岗位名称|岗位|职位|工种|部门|车间|班组|单位|公司|姓名|中文名|印方姓名|领用人|领料人|人员|员工|name|nama|id卡号|id号|卡号|工号|id|nik|状态|是否休假|休假|请假|在岗|在职|备注|说明|正确id|照片|签字|签名|领用签字|领取签字|日期|时间|合计|总计|小计)$/i;
+  const META_COL_RE = /^(序号|no\.?|编号|岗位分类|岗位名称|岗位|职位|工种|jabatan|posisi|position|部门|departemen|department|bagian|divisi|车间|班组|单位|公司|姓名|中文名|印方姓名|领用人|领料人|人员|员工|name|nama|id卡号|id号|卡号|工号|id|nik|状态|是否休假|休假|请假|在岗|在职|status|备注|说明|keterangan|ket|正确id|照片|签字|签名|领用签字|领取签字|日期|时间|合计|总计|小计)$/i;
   const GENERIC_GROUP_RE = /^(劳保物资|劳保用品|领用物资|劳保明细|申领物资|发放物资|物资名称|物品)$/i;
   const PPE_HINT_RE = /手套|口罩|过滤棉|滤棉|滤盒|滤毒|劳保|安全帽|耳塞|耳罩|安全鞋|劳保鞋|胶鞋|雨鞋|水鞋|眼镜|护目镜|面罩|面屏|围裙|套袖|袖套|工作服|防护服|雨衣|反光|毛巾|肥皂|香皂|洗衣粉|鞋垫|袜|防尘|防毒|焊|电工|耐酸|耐油|帆布|尼龙|线手套|浸胶|丁腈|乳胶/i;
 
@@ -110,7 +114,6 @@
       state.workshopFilter = 'ALL';
     }
 
-    // 从本地 IndexedDB 真实恢复中/印花名册索引（若内存中没有真实索引，强制归 0，杜绝假绿灯）
     const rosters = await loadLocalRosters();
     if (rosters) {
       state.cnById = rosters.cnById || {};
@@ -124,7 +127,7 @@
       state.idRosterOstCount = state.idRosterCount ? (rosters.idRosterOstCount || 0) : 0;
       state.idRosterFileName = state.idRosterCount ? (rosters.idRosterFileName || '') : '';
     } else {
-      state.cnRosterCount = Object.keys(state.cnById).length || Object.keys(state.cnByName).length ? state.cnRosterCount : 0;
+      state.cnRosterCount = (Object.keys(state.cnById).length || Object.keys(state.cnByName).length) ? state.cnRosterCount : 0;
       state.idRosterCount = Object.keys(state.idByNik).length ? state.idRosterCount : 0;
       if (!state.idRosterCount) { state.idRosterHjfCount = 0; state.idRosterOstCount = 0; }
     }
@@ -136,6 +139,11 @@
 
   function isChineseName(name) {
     return /[\u4e00-\u9fa5]/.test(String(name || ''));
+  }
+
+  function extractPureChineseName(name) {
+    const m = String(name || '').match(/[\u4e00-\u9fa5]+/g);
+    return m ? m.join('') : '';
   }
 
   function isTissueName(text) {
@@ -150,6 +158,23 @@
     const m = s.match(/\b(KPS|CKM|BJL|HJS|ONC|HPL|DPL)\b/) || s.match(/^(KPS|CKM|BJL|HJS|ONC|HPL|DPL)/);
     if (m) return m[1];
     return fallback;
+  }
+
+  /** 检测单元格是否填充了红色背景（用于识别车间表“红色为休假”标记，绝不误判黄/绿/蓝/白） */
+  function isRedFillCell(ws, r, c) {
+    if (!ws || r < 0 || c < 0 || typeof XLSX === 'undefined' || !XLSX.utils || !XLSX.utils.encode_cell) return false;
+    const cell = ws[XLSX.utils.encode_cell({ r, c })];
+    if (!cell || !cell.s) return false;
+    const s = cell.s;
+    if (s.patternType === 'none') return false;
+    const rgbRaw = (s.fgColor && s.fgColor.rgb) || (s.bgColor && s.bgColor.rgb) || '';
+    const hex = String(rgbRaw).replace(/^#/, '').toUpperCase();
+    const rgb6 = hex.length === 8 ? hex.slice(2) : (hex.length === 6 ? hex : '');
+    if (!/^[0-9A-F]{6}$/.test(rgb6)) return false;
+    const R = parseInt(rgb6.slice(0, 2), 16);
+    const G = parseInt(rgb6.slice(2, 4), 16);
+    const B = parseInt(rgb6.slice(4, 6), 16);
+    return R >= 170 && G <= 95 && B <= 95 && (R - G) >= 90 && (R - B) >= 90;
   }
 
   /** 对单个未休假人员执行中/印双花名册交叉核对 */
@@ -187,7 +212,9 @@
               issueDesc = `印方花名册状态为 ${idFallback.status}`;
             }
           } else {
-            const nameHits = state.cnByName[name] || [];
+            // 兼容「张羊羊 zhang yang yang」中英双语格式，剥离拼音匹配中方花名册
+            const pureCn = extractPureChineseName(name);
+            const nameHits = state.cnByName[name] || (pureCn ? state.cnByName[pureCn] : null) || [];
             if (nameHits.length > 0) {
               const first = nameHits[0];
               if (first.leftDate) {
@@ -355,7 +382,122 @@
     U.toast(`印方人员名单载入成功：HJF ${hjfCnt} 人 / OST ${ostCnt} 人（共 ${total} 人索引）${extra}`, 'success');
   }
 
-  /** 解析单份车间劳保申请表（兼容 Sheet1、两行合并表头、小车间表、宽表矩阵与竖表） */
+  /**
+   * 扫描同一表头行中的所有并排人员栏位组（支持单栏，也支持左印方 No|NIK|Nama + 右中方 No|NIK|Nama|Jabatan 并排双栏/多栏）
+   */
+  function findPersonColumnGroups(h) {
+    const nameCols = [];
+    h.forEach((col, idx) => {
+      if (/姓名|^Name$|^Nama$/i.test(col)) nameCols.push(idx);
+    });
+    if (nameCols.length === 0) {
+      const fb = h.findIndex(x => /领用人|领料人|员工名/.test(x));
+      if (fb >= 0) nameCols.push(fb);
+    }
+    if (nameCols.length === 0) return [];
+
+    // 单栏标准表
+    if (nameCols.length === 1) {
+      const iName = nameCols[0];
+      return [{
+        iSeq: h.findIndex(x => /^序号|^no\.?$/i.test(x)),
+        iDept: h.findIndex(x => /岗位分类|部门|车间|班组|departemen|department/i.test(x)),
+        iRole: h.findIndex(x => /岗位名称|岗位|工种|职位|jabatan|posisi|position/i.test(x) && !/分类/.test(x)),
+        iName,
+        iId: h.findIndex(x => /ID卡号|ID号|卡号|工号|^NIK$|^ID$/i.test(x)),
+        iLeave: h.findIndex(x => /休假|状态|请假|在岗|^status$/i.test(x)),
+        iRem: h.findIndex(x => /备注|说明|keterangan/i.test(x))
+      }];
+    }
+
+    // 多栏并排人员表：按每个「姓名/Nama」列拆出独立水平区间，不丢任何一栏！
+    const groups = [];
+    for (let g = 0; g < nameCols.length; g++) {
+      const nc = nameCols[g];
+      // 计算当前栏的左右边界：左界为上一栏姓名列后方（优先从本栏最近的 No/序号/NIK 起点起），右界到下一栏起始前
+      let leftBound = g === 0 ? 0 : nameCols[g - 1] + 1;
+      let rightBound = g === nameCols.length - 1 ? h.length - 1 : nameCols[g + 1] - 1;
+
+      // 若下一栏左侧紧挨着 No/NIK，收紧本栏右界避免把下一栏的 No/NIK 算进本栏
+      if (g < nameCols.length - 1) {
+        const nextNc = nameCols[g + 1];
+        for (let k = nextNc - 1; k > nc; k--) {
+          if (/^序号|^no\.?$|ID卡号|ID号|卡号|工号|^NIK$|^ID$/i.test(h[k])) {
+            rightBound = Math.min(rightBound, k - 1);
+          } else if (h[k] === '') {
+            rightBound = Math.min(rightBound, k - 1);
+            break;
+          } else {
+            break;
+          }
+        }
+      }
+      // 同样收紧本栏左界到本栏之前最近的空列之后（如果有空列分隔左右两栏）
+      if (g > 0) {
+        for (let k = nc - 1; k >= leftBound; k--) {
+          if (h[k] === '' && !/^序号|^no\.?$|ID卡号|ID号|卡号|工号|^NIK$|^ID$/i.test(h[k])) {
+            leftBound = k + 1;
+            break;
+          }
+        }
+      }
+
+      const findInRange = (re, exclRe) => {
+        for (let k = leftBound; k <= rightBound; k++) {
+          if (re.test(h[k]) && (!exclRe || !exclRe.test(h[k]))) return k;
+        }
+        return -1;
+      };
+
+      groups.push({
+        iSeq: findInRange(/^序号|^no\.?$/i),
+        iDept: findInRange(/岗位分类|部门|车间|班组|departemen|department/i),
+        iRole: findInRange(/岗位名称|岗位|工种|职位|jabatan|posisi|position/i, /分类/),
+        iName: nc,
+        iId: findInRange(/ID卡号|ID号|卡号|工号|^NIK$|^ID$/i),
+        iLeave: findInRange(/休假|状态|请假|在岗|^status$/i),
+        iRem: findInRange(/备注|说明|keterangan/i)
+      });
+    }
+    return groups;
+  }
+
+  /** 从同表上半部的「通用物资领料申报单」汇总区提取纯劳保物资汇总（用于下半部纯人员花名册无逐人物资列的场景） */
+  function extractTopRequisitionItems(aoa, beforeRowIdx) {
+    const items = {};
+    let excludedTissue = 0;
+    let sumHdrIdx = -1;
+    let iSumName = -1;
+    let iSumQty = -1;
+
+    for (let i = 0; i < Math.min(beforeRowIdx, aoa.length); i++) {
+      const row = aoa[i].map(v => U.cleanStr(v));
+      const idxName = row.findIndex(x => /存货名称|物资名称|物料名称|品名/.test(x));
+      const idxQty = row.findIndex(x => /领用数量|申领数量|发放数量|数量/.test(x));
+      if (idxName >= 0 && idxQty >= 0) {
+        sumHdrIdx = i;
+        iSumName = idxName;
+        iSumQty = idxQty;
+        break;
+      }
+    }
+    if (sumHdrIdx < 0) return { items, excludedTissue };
+
+    for (let i = sumHdrIdx + 1; i < Math.min(beforeRowIdx, aoa.length); i++) {
+      const r = aoa[i];
+      const name = U.cleanStr(r[iSumName]);
+      const qty = U.parseNum(r[iSumQty]);
+      if (!name || qty <= 0) continue;
+      if (/^(合计|总计|小计|存货名称|物资名称)/.test(name)) continue;
+      if (isTissueName(name)) { excludedTissue++; continue; }
+      const cleanName = name.replace(/\s+/g, ' ');
+      if (!items[cleanName]) items[cleanName] = { qty: 0, people: 0 };
+      items[cleanName].qty += qty;
+    }
+    return { items, excludedTissue };
+  }
+
+  /** 解析单份车间劳保申请表（兼容 Sheet1、两行合并表头、并排双栏花名册、红底标休假、宽表矩阵与竖表） */
   async function parseSingleWorkshopFile(file) {
     const parsed = await U.readSpreadsheet(file);
     let targetSn = parsed.sheetNames[0];
@@ -363,13 +505,12 @@
     let bestHdrIdx = 0;
 
     for (const sn of parsed.sheetNames) {
-      // 仅排除明确的非车间明细辅助表；绝不再一刀切跳过 Sheet1！
       if (/^(纸巾领用|无ID信息.*|问题人员名单|车间物资明细|汇总|总汇总)$/i.test(sn.trim())) continue;
       const aoa = parsed.sheets[sn] || [];
       if (aoa.length < 2) continue;
 
       const isGenericSheet = /^Sheet\d+$/i.test(sn.trim());
-      for (let i = 0; i < Math.min(30, aoa.length); i++) {
+      for (let i = 0; i < Math.min(35, aoa.length); i++) {
         const cells = aoa[i].map(v => U.cleanStr(v));
         const line = cells.join(' ');
         const nextLine = (aoa[i + 1] || []).map(v => U.cleanStr(v)).join(' ');
@@ -377,12 +518,14 @@
         let score = 0;
 
         // 强力跳过同一张表上半部的「通用物资领料申报单」汇总区（含 存货编码 / 仓库名称 / 规格型号），精准锁定下半部真正的人员明细表头
-        const isRequisitionBanner = /存货编码|物资编码|物料编码/.test(line) && /仓库名称|规格型号|存货名称|领用数量/.test(line);
+        const isRequisitionBanner = (/存货编码|物资编码|物料编码|仓库名称/.test(line) && /规格型号|存货名称|领用数量/.test(line));
         if (isRequisitionBanner) score -= 25;
 
-        if (/姓名|\bNama\b|\bName\b/i.test(line)) score += 10;
+        const nameMatchCnt = cells.filter(c => /姓名|^Nama$|^Name$/i.test(c)).length;
+        const idMatchCnt = cells.filter(c => /ID卡号|ID号|卡号|工号|^NIK$|^ID$/i.test(c)).length;
+        if (nameMatchCnt > 0) score += 10 + Math.min(6, (nameMatchCnt - 1) * 4);
         else if (/领用人|领料人|员工名/.test(line)) score += 4;
-        if (/ID卡号|ID号|卡号|工号|\bNIK\b/i.test(line)) score += 10;
+        if (idMatchCnt > 0) score += 10 + Math.min(6, (idMatchCnt - 1) * 4);
         if (/休假|状态|请假|在岗/.test(line)) score += 4;
         if (PPE_HINT_RE.test(line)) score += 4;
         else if (PPE_HINT_RE.test(combined)) score += 2;
@@ -390,7 +533,7 @@
         if (!isGenericSheet) score += 1;
         if (aoa.length > 5) score += 1;
         const nonEmptyCells = cells.filter(v => v !== '').length;
-        if (nonEmptyCells < 3) score -= 10;
+        if (nonEmptyCells < 2) score -= 10;
 
         if (score > bestScore) {
           bestScore = score;
@@ -406,6 +549,9 @@
       throw new Error(`[${file.name}] 表[${targetSn}]未识别到标准劳保人员表头（缺少 姓名/Nama 与 工号/ID卡号/NIK 列），请检查表格格式`);
     }
 
+    const rawWs = parsed.wb && parsed.wb.Sheets ? parsed.wb.Sheets[targetSn] : null;
+    const wsRange = rawWs && rawWs['!ref'] ? XLSX.utils.decode_range(rawWs['!ref']) : { s: { r: 0, c: 0 } };
+
     // 合并可能存在的「两行合并表头」（如主表头写“劳保物资”，下一行写“帆布手套 / 口罩 / 安全帽”）
     const mainH = aoa[bestHdrIdx].map(v => U.cleanStr(v).replace(/\s+/g, ' '));
     const subRow = aoa[bestHdrIdx + 1] ? aoa[bestHdrIdx + 1].map(v => U.cleanStr(v).replace(/\s+/g, ' ')) : [];
@@ -415,7 +561,6 @@
     if (iNameTmp < 0) iNameTmp = mainH.findIndex(x => /领用人|领料人|员工名/.test(x));
     let iIdTmp = mainH.findIndex(x => /ID卡号|ID号|卡号|工号|^NIK$|^ID$/i.test(x));
 
-    // 判断 bestHdrIdx + 1 是否是二级表头：在姓名/ID列为空（纵向合并），且其他列出现具体劳保品名或单位
     let hasSubHeader = false;
     if (subRow.length > 0) {
       const nameCellSub = iNameTmp >= 0 ? (subRow[iNameTmp] || '') : '';
@@ -443,21 +588,20 @@
 
     const dataStartIdx = bestHdrIdx + (hasSubHeader ? 2 : 1);
 
-    const iSeq = h.findIndex(x => /^序号|no\.?$/i.test(x));
-    const iDept = h.findIndex(x => /岗位分类|部门|车间|班组/.test(x));
-    const iRole = h.findIndex(x => /岗位名称|岗位|工种|职位/.test(x) && !/分类/.test(x));
-    // 严格优先匹配「姓名 / Nama / Name」，避免同表出现「领用人」列时抓错成代领人
-    let iName = h.findIndex(x => /姓名|^Name$|^Nama$/i.test(x));
-    if (iName < 0) iName = h.findIndex(x => /领用人|领料人|员工名/.test(x));
-    const iId = h.findIndex(x => /ID卡号|ID号|卡号|工号|^NIK$|^ID$/i.test(x));
-    const iLeave = h.findIndex(x => /休假|状态|请假|在岗/.test(x));
-    const iRem = h.findIndex(x => /备注|说明/.test(x));
+    // 识别全部并排人员栏位组（单栏 or 左/右并排双栏/多栏）
+    const personGroups = findPersonColumnGroups(h);
+    const groupUsedCols = new Set();
+    personGroups.forEach(g => {
+      [g.iSeq, g.iDept, g.iRole, g.iName, g.iId, g.iLeave, g.iRem].forEach(c => {
+        if (c >= 0) groupUsedCols.add(c);
+      });
+    });
 
     const ppeCols = [];
     let excludedTissueCols = 0;
     h.forEach((colName, idx) => {
       if (!colName) return;
-      if ([iSeq, iDept, iRole, iName, iId, iLeave, iRem].includes(idx)) return;
+      if (groupUsedCols.has(idx)) return;
       const stripped = colName.replace(/（.*?）|\(.*?\)/g, '').trim();
       if (!stripped || /^\d+$/.test(stripped)) return;
       if (META_COL_RE.test(stripped) || GENERIC_GROUP_RE.test(stripped)) return;
@@ -468,8 +612,8 @@
       ppeCols.push({ idx, name: colName.replace(/\n+/g, '') });
     });
 
-    const isMatrix = ppeCols.length >= 1 && iName >= 0;
     const expectedCompany = detectCompanyFromText(`${file.name} ${targetSn}`, 'HJF');
+    const defaultDeptName = file.name.replace(/\.[^.]+$/, '');
 
     const itemMap = {};      // itemName -> { qty, people }
     const people = [];       // [{ seq, dept, name, idRaw, rem }] 留存以便导入新花名册后自动重核
@@ -480,53 +624,77 @@
     let idActive = 0;
     let leaveSkipped = 0;
 
-    if (isMatrix) {
+    // 场景 A：宽表矩阵（单栏人员 + 逐人劳保列）或 场景 B：并排双栏/纯人员花名册 + 上方申报单汇总
+    const isPersonRosterMode = personGroups.length >= 1 && (ppeCols.length >= 1 || personGroups.length >= 2 || bestHdrIdx >= 3);
+
+    if (isPersonRosterMode) {
       for (let i = dataStartIdx; i < aoa.length; i++) {
         const r = aoa[i];
-        const name = iName >= 0 ? U.cleanStr(r[iName]) : '';
-        const idRaw = iId >= 0 ? normId(r[iId]) : '';
-        const dept = iDept >= 0 ? U.cleanStr(r[iDept]) : (iRole >= 0 ? U.cleanStr(r[iRole]) : file.name.replace(/\.[^.]+$/, ''));
-        if (!name && !idRaw) continue;
-        if (/^(合计|总计|小计|汇总|人数|统计|制表|审核|审批|签字)/.test(name) || /^(合计|总计|小计|汇总)/.test(dept)) continue;
-        // 跳过重复表头行
-        if (/^(姓名|领用人|Name|Nama)$/i.test(name)) continue;
+        const wsRowIdx = wsRange.s.r + i;
 
-        // 铁律：休假/休息/Cuti 人员不用管，直接跳过，仅处理未休假人员
-        const leaveRaw = iLeave >= 0 ? U.cleanStr(r[iLeave]) : '';
-        const isLeave = /^(是|yes|y)$/i.test(leaveRaw) || /休假|请假|休息|离职|回国|不在岗|cuti|resign/i.test(leaveRaw);
-        if (isLeave) {
-          leaveSkipped++;
-          continue;
-        }
+        for (let gIdx = 0; gIdx < personGroups.length; gIdx++) {
+          const g = personGroups[gIdx];
+          const name = g.iName >= 0 ? U.cleanStr(r[g.iName]) : '';
+          const idRaw = g.iId >= 0 ? normId(r[g.iId]) : '';
+          if (!name && !idRaw) continue;
 
-        activePeople++;
-        const isCn = isChineseName(name);
-        if (isCn) cnActive++;
-        else idActive++;
+          const dept = g.iDept >= 0 ? U.cleanStr(r[g.iDept]) : (g.iRole >= 0 ? U.cleanStr(r[g.iRole]) : defaultDeptName);
+          if (/^(合计|总计|小计|汇总|人数|统计|制表|审核|审批|签字)/.test(name) || /^(合计|总计|小计|汇总)/.test(dept)) continue;
+          if (/^(姓名|领用人|Name|Nama)$/i.test(name) || /^(NIK|ID|ID卡号|工号)$/i.test(idRaw)) continue;
 
-        const seq = iSeq >= 0 ? U.cleanStr(r[iSeq]) : String(activePeople);
-        const rem = iRem >= 0 ? U.cleanStr(r[iRem]) : '';
-
-        // 汇总纯劳保物资（仅未休假）
-        ppeCols.forEach(col => {
-          const qty = U.parseNum(r[col.idx]);
-          if (!itemMap[col.name]) itemMap[col.name] = { qty: 0, people: 0 };
-          if (qty > 0) {
-            itemMap[col.name].qty += qty;
-            itemMap[col.name].people += 1;
-            details.push([file.name, dept, name, col.name, qty]);
+          // 休假判定：① 文字状态（是/休假/休息/Cuti/请假/离职）；② 单元格红色底纹标休假（红色为休假）
+          const leaveRaw = g.iLeave >= 0 ? U.cleanStr(r[g.iLeave]) : '';
+          const textLeave = /^(是|yes|y)$/i.test(leaveRaw) || /休假|请假|休息|离职|回国|不在岗|cuti|resign/i.test(leaveRaw);
+          const colorLeave = rawWs && (
+            (g.iName >= 0 && isRedFillCell(rawWs, wsRowIdx, wsRange.s.c + g.iName)) ||
+            (g.iId >= 0 && isRedFillCell(rawWs, wsRowIdx, wsRange.s.c + g.iId))
+          );
+          if (textLeave || colorLeave) {
+            leaveSkipped++;
+            continue;
           }
-        });
 
-        const personRec = { seq, dept, name, idRaw, rem };
-        people.push(personRec);
-        const issueRow = auditSinglePerson(personRec, file.name, expectedCompany);
-        if (issueRow) issues.push(issueRow);
+          activePeople++;
+          const isCn = isChineseName(name);
+          if (isCn) cnActive++;
+          else idActive++;
+
+          const seq = g.iSeq >= 0 && U.cleanStr(r[g.iSeq]) ? U.cleanStr(r[g.iSeq]) : String(activePeople);
+          const rem = g.iRem >= 0 ? U.cleanStr(r[g.iRem]) : '';
+
+          // 逐人劳保列汇总（标准矩阵表）
+          if (ppeCols.length > 0 && personGroups.length === 1) {
+            ppeCols.forEach(col => {
+              const qty = U.parseNum(r[col.idx]);
+              if (!itemMap[col.name]) itemMap[col.name] = { qty: 0, people: 0 };
+              if (qty > 0) {
+                itemMap[col.name].qty += qty;
+                itemMap[col.name].people += 1;
+                details.push([file.name, dept, name, col.name, qty]);
+              }
+            });
+          }
+
+          const personRec = { seq, dept, name, idRaw, rem };
+          people.push(personRec);
+          const issueRow = auditSinglePerson(personRec, file.name, expectedCompany);
+          if (issueRow) issues.push(issueRow);
+        }
+      }
+
+      // 若下半部仅为纯人员花名册（无逐人劳保列，如左印方 + 右中方并排名单），自动从上方「通用物资领料申报单」提取纯劳保汇总！
+      if (ppeCols.length === 0) {
+        const topSum = extractTopRequisitionItems(aoa, bestHdrIdx);
+        excludedTissueCols += topSum.excludedTissue;
+        Object.entries(topSum.items).forEach(([k, v]) => {
+          itemMap[k] = { qty: v.qty, people: activePeople };
+        });
       }
     } else {
-      // 兼容传统竖表明细格式（严禁误把序号列当物资名，且照常执行中/印统计与花名册核对）
-      const iItem = h.findIndex((x, idx) => idx !== iSeq && idx !== iName && idx !== iId && /物资|品名|名称|劳保|用品/.test(x) && !/部门|岗位|公司|姓名/.test(x));
-      const iQty = h.findIndex((x, idx) => idx !== iSeq && /数量|实发|发放|申领/.test(x));
+      // 兜底：传统竖表明细格式
+      const g0 = personGroups[0] || { iSeq: -1, iDept: -1, iName: -1, iId: -1, iLeave: -1, iRem: -1 };
+      const iItem = h.findIndex((x, idx) => !groupUsedCols.has(idx) && /物资|品名|名称|劳保|用品/.test(x) && !/部门|岗位|公司|姓名/.test(x));
+      const iQty = h.findIndex((x, idx) => !groupUsedCols.has(idx) && /数量|实发|发放|申领/.test(x));
       if (iItem < 0) {
         throw new Error(`[${file.name}] 表[${targetSn}]既无横向劳保物资列，也无竖表【物资名称】列，无法统计`);
       }
@@ -534,15 +702,15 @@
       const seenPerson = new Set();
       for (let i = dataStartIdx; i < aoa.length; i++) {
         const r = aoa[i];
-        const dept = iDept >= 0 ? U.cleanStr(r[iDept]) : '未分部门';
-        const person = iName >= 0 ? U.cleanStr(r[iName]) : '';
-        const idRaw = iId >= 0 ? normId(r[iId]) : '';
+        const dept = g0.iDept >= 0 ? U.cleanStr(r[g0.iDept]) : defaultDeptName;
+        const person = g0.iName >= 0 ? U.cleanStr(r[g0.iName]) : '';
+        const idRaw = g0.iId >= 0 ? normId(r[g0.iId]) : '';
         const item = U.cleanStr(r[iItem]);
         const qty = iQty >= 0 ? U.parseNum(r[iQty]) : 1;
-        const leaveRaw = iLeave >= 0 ? U.cleanStr(r[iLeave]) : '';
+        const leaveRaw = g0.iLeave >= 0 ? U.cleanStr(r[g0.iLeave]) : '';
         if (!item || /^\d+$/.test(item) || GENERIC_GROUP_RE.test(item)) continue;
         if (/^(合计|总计|小计|汇总)/.test(dept) || /^(合计|总计|小计|汇总)/.test(person) || /^(合计|总计|小计|汇总)/.test(item)) continue;
-        if (/^(是|休假|请假|离职|yes|y)$/i.test(leaveRaw)) { leaveSkipped++; continue; }
+        if (/^(是|yes|y)$/i.test(leaveRaw) || /休假|请假|休息|离职|cuti/i.test(leaveRaw)) { leaveSkipped++; continue; }
         if (isTissueName(item)) { excludedTissueCols++; continue; }
         if (qty <= 0) continue;
 
@@ -557,8 +725,8 @@
           activePeople++;
           if (isChineseName(person)) cnActive++;
           else idActive++;
-          const seq = iSeq >= 0 ? U.cleanStr(r[iSeq]) : String(activePeople);
-          const rem = iRem >= 0 ? U.cleanStr(r[iRem]) : '';
+          const seq = g0.iSeq >= 0 ? U.cleanStr(r[g0.iSeq]) : String(activePeople);
+          const rem = g0.iRem >= 0 ? U.cleanStr(r[g0.iRem]) : '';
           const personRec = { seq, dept, name: person, idRaw, rem };
           people.push(personRec);
           const issueRow = auditSinglePerson(personRec, file.name, expectedCompany);
@@ -580,6 +748,7 @@
       idActive,
       leaveSkipped,
       excludedTissueCols,
+      groupCount: personGroups.length,
       itemMap,
       people,
       issues,
@@ -647,7 +816,7 @@
       .map(([name, info]) => [name, U.fmtNum(info.qty), info.people]);
     const wsRows = state.workshops.map(w => [
       w.fileName,
-      w.sheetName,
+      w.sheetName + (w.groupCount > 1 ? ` (${w.groupCount}栏并排)` : ''),
       w.expectedCompany,
       w.activePeople,
       `${w.cnActive} / ${w.idActive}`,
@@ -664,12 +833,12 @@
     root.innerHTML = `
       <div class="panel">
         <div class="panel-title">
-          <span>🦺 劳保物资批量汇总 & 中/印双花名册核对（仅处理未休假人员 · 自动剔除纸巾类）</span>
+          <span>🦺 劳保物资批量汇总 & 中/印双花名册核对（仅处理未休假人员 · 支持并排双栏与红底休假 · 自动剔除纸巾）</span>
           <span class="pill pill-blue">已载入 ${state.workshops.length} 个车间劳保表</span>
         </div>
         <div class="kpi-grid">
           <div class="kpi-card blue"><div class="kpi-label">未休假在岗人数 (中方/印方)</div><div class="kpi-val">${agg.activePeople} (${agg.cnActive}/${agg.idActive})</div></div>
-          <div class="kpi-card"><div class="kpi-label">已跳过休假人数（不处理）</div><div class="kpi-val">${agg.leaveSkipped}</div></div>
+          <div class="kpi-card"><div class="kpi-label">已跳过休假人数（含红底标休）</div><div class="kpi-val">${agg.leaveSkipped}</div></div>
           <div class="kpi-card ${agg.allIssues.length ? 'red' : 'green'}"><div class="kpi-label">未休假问题人员数</div><div class="kpi-val">${agg.allIssues.length}</div></div>
           <div class="kpi-card green"><div class="kpi-label">纯劳保物资种类</div><div class="kpi-val">${agg.itemRows.length}</div></div>
         </div>
